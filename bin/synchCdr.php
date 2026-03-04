@@ -50,6 +50,47 @@ function processExists():bool
     return $result;
 }
 
+function truncateForLog(string $value, int $maxLen = 3000): string
+{
+    if (strlen($value) <= $maxLen) {
+        return $value;
+    }
+    $tailLen = strlen($value) - $maxLen;
+    return substr($value, 0, $maxLen) . "... [truncated {$tailLen} bytes]";
+}
+
+function logHttpRequest(Logger $logger, string $method, string $url, array $query, string $label): void
+{
+    $logger->writeInfo([
+        'label' => $label,
+        'method' => $method,
+        'url' => $url,
+        'query' => $query,
+    ], 'HTTP request');
+}
+
+function logHttpResponse(Logger $logger, int $status, string $body, string $label, bool $error = false): void
+{
+    $payload = [
+        'label' => $label,
+        'status' => $status,
+        'body' => truncateForLog($body),
+    ];
+    if ($error) {
+        $logger->writeError($payload, 'HTTP response');
+        return;
+    }
+    $logger->writeInfo($payload, 'HTTP response');
+}
+
+function logHttpException(Logger $logger, \Exception $e, string $label): void
+{
+    $logger->writeError([
+        'label' => $label,
+        'exception' => $e->getMessage(),
+    ], 'HTTP exception');
+}
+
 if(processExists()){
     echo "Process exists...".PHP_EOL;
     exit(12);
@@ -70,7 +111,7 @@ try {
         $domain = $host;
     }
 }catch (\Exception $e){
-    $logger->writeError('Error parce authApiKey...'.$e->getMessage());
+    $logger->writeError('Error parse authApiKey...'.$e->getMessage());
 }
 
 if(empty($domain)){
@@ -91,24 +132,29 @@ if(empty($settings->offset)){
 }
 $endTime   = date("Y-m-d\TH:i:s");
 try {
+    $trunksUrl = 'https://aa.mts.ru/api/ac20/trunks/all';
+    $trunksQuery = [
+        'Domain'  => $domain,
+    ];
+    logHttpRequest($logger, 'GET', $trunksUrl, $trunksQuery, 'trunks/all');
     $client = new Client();
-    $response = $client->request('GET', 'https://aa.mts.ru/api/ac20/trunks/all', [
-        'query' => [
-            'Domain'  => $domain,
-        ],
+    $response = $client->request('GET', $trunksUrl, [
+        'query' => $trunksQuery,
         'headers' => [
             'Authorization' => 'Bearer '.$settings->authApiKey,
             'accept' => 'application/json',
         ],
         'timeout' => 5, 'connect_timeout' => 5, 'read_timeout' => 5
     ]);
-    $trunksData = json_decode($response->getBody(), true);
+    $message = (string)$response->getBody();
+    $trunksData = json_decode($message, true);
     $status  = $response->getStatusCode();
-    $message = $response->getBody();
+    logHttpResponse($logger, $status, $message, 'trunks/all');
 }catch (\Exception $e){
     $trunksData = null;
     $status = 0;
     $message = $e->getMessage();
+    logHttpException($logger, $e, 'trunks/all');
 }
 if(!is_array($trunksData)){
     $logger->writeError([$status, $message],"Fail Get Trunks");
@@ -123,38 +169,56 @@ foreach ($trunksData as $trunkData) {
     while ($count>=$limit){
         $logger->writeInfo("Get CDR for $trunkData[trunkId], offset: $offset");
         usleep(200000);
+        $statsUrl = 'https://aa.mts.ru/api/ac20/trunks/statistics';
+        $statsQuery = [
+            'Domain'  => $domain,
+            'TrunkId' => $trunkData['trunkId'],
+            'Begin'   => $startTime,
+            'End'     => $endTime,
+            'Limit'   => $limit,
+            'Offset'  => $offset,
+        ];
+        $logger->writeInfo($statsQuery, 'Statistics request params');
+        logHttpRequest($logger, 'GET', $statsUrl, $statsQuery, 'trunks/statistics');
         try {
-            $response = $client->request('GET', 'https://aa.mts.ru/api/ac20/trunks/statistics', [
-                'query' => [
-                    'Domain'  => $domain,
-                    'TrunkId' => $trunkData['trunkId'],
-                    'Begin'   => $startTime,
-                    'End'     => $endTime,
-                    'Limit'   => $limit,
-                    'Offset'  => $offset,
-                ],
+            $response = $client->request('GET', $statsUrl, [
+                'query' => $statsQuery,
                 'headers' => [
                     'Authorization' => 'Bearer '.$settings->authApiKey,
                     'accept' => 'application/json',
                 ],
                 'timeout' => 5, 'connect_timeout' => 5, 'read_timeout' => 5
             ]);
-            $res = json_decode($response->getBody(), true);
+            $message = (string)$response->getBody();
+            $res = json_decode($message, true);
             $status = $response->getStatusCode();
-            $message = $response->getBody();
+            logHttpResponse($logger, $status, $message, 'trunks/statistics');
         }catch (\Exception $e){
             $res = null;
             $status = 0;
             $message = $e->getMessage();
+            logHttpException($logger, $e, 'trunks/statistics');
         }
         if(is_array($res)){
             $count  = count($res);
             $offset = $offset + $count - ($offset===0?1:0);
             $results[] = $res;
+        }elseif ($status === 204) {
+            // No CDR data for the selected period/page, not an error.
+            $count = 0;
+            $logger->writeInfo([
+                'trunkId' => $trunkData['trunkId'],
+                'offset' => $offset,
+                'status' => $status,
+            ], 'CDR page is empty');
         }else{
             $count = 0;
             $haveError = true;
-            $logger->writeError(["status: $status", $message],"Fail Get CDR for $trunkData[trunkId] offset: $offset");
+            $logger->writeError([
+                "status: $status",
+                $message,
+                'query' => $statsQuery,
+            ],"Fail Get CDR for $trunkData[trunkId] offset: $offset");
         }
     }
 }
@@ -208,14 +272,17 @@ foreach ($fsData as $index => $cdr){
         $filenameFail = $filename.'.fail';
         if(!file_exists($filename)){
             Util::mwMkdir(dirname($filename));
+            $recordUrl = 'https://aa.mts.ru/api/ac20/trunks/record';
+            $recordQuery = [
+                'Domain'  => $domain,
+                'TrunkId' => $cdr['trunkId'],
+                'CallId'   => $cdr['callId'],
+                'Type'   => 'mp3'
+            ];
+            logHttpRequest($logger, 'GET', $recordUrl, $recordQuery, 'trunks/record');
             try {
-                $response = $client->request('GET', 'https://aa.mts.ru/api/ac20/trunks/record', [
-                    'query' => [
-                        'Domain'  => $domain,
-                        'TrunkId' => $cdr['trunkId'],
-                        'CallId'   => $cdr['callId'],
-                        'Type'   => 'mp3'
-                    ],
+                $response = $client->request('GET', $recordUrl, [
+                    'query' => $recordQuery,
                     'headers' => [
                         'Authorization' => 'Bearer '.$settings->authApiKey,
                         'accept' => 'application/json',
@@ -223,27 +290,29 @@ foreach ($fsData as $index => $cdr){
                     'timeout' => 5, 'connect_timeout' => 5, 'read_timeout' => 5
                 ]);
                 $code = $response->getStatusCode();
+                $recordBody = $response->getBody()->getContents();
+                logHttpResponse($logger, $code, $code === 200 ? "binary bytes: ".strlen($recordBody) : $recordBody, 'trunks/record', $code !== 200);
                 if($code === 200){
-                    file_put_contents($filename, $response->getBody()->getContents());
+                    file_put_contents($filename, $recordBody);
                     if(file_exists($filenameFail)){
                         unlink($filenameFail);
                         $logger->writeInfo($cdr,"Get recording OK, was new attempt...");
                     }
                 }else{
-                    $logger->writeError($cdr,"Fail download file code:".$code.', message: '.$response->getBody()->getContents());
-                    file_put_contents($filenameFail, $response->getBody()->getContents());
+                    file_put_contents($filenameFail, $recordBody);
                     $filename = '';
                 }
                 usleep(100000);
             }catch (Exception $e){
                 $logger->writeError($cdr,"Fail download file ".$e->getMessage());
                 $haveError = true;
+                logHttpException($logger, $e, 'trunks/record');
             }
         }
     }else{
         $filenameFail = $filename.'.fail';
         $logger->writeError($cdr,"File not exists - recDur: 0");
-        file_put_contents($filenameFail, $response->getBody()->getContents());
+        file_put_contents($filenameFail, 'recDur is 0, recording is not expected');
     }
 
     $tmpCdr = [
