@@ -124,13 +124,13 @@ if(empty($settings->offset)){
     $logger->writeInfo('Offset is empty start sync -30 day...');
     $startTime = $date->format('Y-m-d\TH:i:s');
 }else{
-    // Создаём объект DateTime из строки
+    // Continue from last saved offset (keep exact time to avoid expanding the requested interval).
     $dt = new DateTime($settings->offset);
-    $dt->setTime(0, 0, 0);
     $startTime = $dt->format('Y-m-d\TH:i:s');
     $logger->writeInfo('Start sync '.$startTime.'...');
 }
-$endTime   = date("Y-m-d\TH:i:s");
+$maxWindowDays = 10;
+$now = new DateTimeImmutable('now');
 try {
     $trunksUrl = 'https://aa.mts.ru/api/ac20/trunks/all';
     $trunksQuery = [
@@ -163,64 +163,103 @@ if(!is_array($trunksData)){
 
 $results = [];
 $limit = 1000;
-foreach ($trunksData as $trunkData) {
-    $offset = 0;
-    $count  = $limit;
-    while ($count>=$limit){
-        $logger->writeInfo("Get CDR for $trunkData[trunkId], offset: $offset");
-        usleep(200000);
-        $statsUrl = 'https://aa.mts.ru/api/ac20/trunks/statistics';
-        $statsQuery = [
-            'Domain'  => $domain,
-            'TrunkId' => $trunkData['trunkId'],
-            'Begin'   => $startTime,
-            'End'     => $endTime,
-            'Limit'   => $limit,
-            'Offset'  => $offset,
-        ];
-        $logger->writeInfo($statsQuery, 'Statistics request params');
-        logHttpRequest($logger, 'GET', $statsUrl, $statsQuery, 'trunks/statistics');
-        try {
-            $response = $client->request('GET', $statsUrl, [
-                'query' => $statsQuery,
-                'headers' => [
-                    'Authorization' => 'Bearer '.$settings->authApiKey,
-                    'accept' => 'application/json',
-                ],
-                'timeout' => 5, 'connect_timeout' => 5, 'read_timeout' => 5
-            ]);
-            $message = (string)$response->getBody();
-            $res = json_decode($message, true);
-            $status = $response->getStatusCode();
-            logHttpResponse($logger, $status, $message, 'trunks/statistics');
-        }catch (\Exception $e){
-            $res = null;
-            $status = 0;
-            $message = $e->getMessage();
-            logHttpException($logger, $e, 'trunks/statistics');
-        }
-        if(is_array($res)){
-            $count  = count($res);
-            $offset = $offset + $count - ($offset===0?1:0);
-            $results[] = $res;
-        }elseif ($status === 204) {
-            // No CDR data for the selected period/page, not an error.
-            $count = 0;
-            $logger->writeInfo([
-                'trunkId' => $trunkData['trunkId'],
-                'offset' => $offset,
-                'status' => $status,
-            ], 'CDR page is empty');
-        }else{
+$statsUrl = 'https://aa.mts.ru/api/ac20/trunks/statistics';
+
+$windowStart = new DateTimeImmutable($startTime);
+while ($windowStart < $now) {
+    $windowEnd = $windowStart->modify("+{$maxWindowDays} days");
+    if ($windowEnd > $now) {
+        $windowEnd = $now;
+    }
+    $windowStartTime = $windowStart->format('Y-m-d\TH:i:s');
+    $windowEndTime = $windowEnd->format('Y-m-d\TH:i:s');
+
+    $logger->writeInfo("Start sync window {$windowStartTime} - {$windowEndTime}...");
+
+    foreach ($trunksData as $trunkData) {
+        $offset = 0;
+        $count  = $limit;
+        while ($count >= $limit) {
+            $trunkId = $trunkData['trunkId'] ?? '';
+            $logger->writeInfo("Get CDR for {$trunkId}, offset: {$offset}");
+            usleep(200000);
+
+            $statsQuery = [
+                'Domain'  => $domain,
+                'TrunkId' => $trunkId,
+                'Begin'   => $windowStartTime,
+                'End'     => $windowEndTime,
+                'Limit'   => $limit,
+                'Offset'  => $offset,
+            ];
+            $logger->writeInfo($statsQuery, 'Statistics request params');
+            logHttpRequest($logger, 'GET', $statsUrl, $statsQuery, 'trunks/statistics');
+            try {
+                $response = $client->request('GET', $statsUrl, [
+                    'query' => $statsQuery,
+                    'headers' => [
+                        'Authorization' => 'Bearer '.$settings->authApiKey,
+                        'accept' => 'application/json',
+                    ],
+                    'timeout' => 5, 'connect_timeout' => 5, 'read_timeout' => 5
+                ]);
+                $message = (string)$response->getBody();
+                $res = json_decode($message, true);
+                $status = $response->getStatusCode();
+                logHttpResponse($logger, $status, $message, 'trunks/statistics');
+            } catch (\Exception $e) {
+                $res = null;
+                $status = 0;
+                $message = $e->getMessage();
+                logHttpException($logger, $e, 'trunks/statistics');
+            }
+
+            if (is_array($res)) {
+                $count  = count($res);
+                $offset = $offset + $count - ($offset === 0 ? 1 : 0);
+                $results[] = $res;
+                continue;
+            }
+
+            if ($status === 204) {
+                // No CDR data for the selected period/page, not an error.
+                $count = 0;
+                $logger->writeInfo([
+                    'trunkId' => $trunkData['trunkId'],
+                    'offset' => $offset,
+                    'status' => $status,
+                    'window' => [$windowStartTime, $windowEndTime],
+                ], 'CDR page is empty');
+                continue;
+            }
+
             $count = 0;
             $haveError = true;
             $logger->writeError([
                 "status: $status",
                 $message,
                 'query' => $statsQuery,
-            ],"Fail Get CDR for $trunkData[trunkId] offset: $offset");
+            ], "Fail Get CDR for {$trunkId} offset: {$offset}");
+            break 2; // stop syncing this window on any error
         }
     }
+
+    if ($haveError) {
+        break;
+    }
+
+    // Window synced successfully. Persist progress and move to next window.
+    $settings->offset = $windowEndTime;
+    $settings->save();
+    $logger->writeInfo("Update offset  {$windowEndTime}...");
+
+    if ($windowEnd >= $now) {
+        break;
+    }
+    $windowStart = $windowEnd;
+}
+if (empty($results)) {
+    exit(0);
 }
 
 $fsData = array_merge(...$results);
@@ -367,8 +406,4 @@ foreach ($fsData as $index => $cdr){
 if(!empty($cdrData['rows'])){
     $clientBeanstalk->publish(json_encode($cdrData),WorkerCallEvents::class);
 }
-if($haveError === false){
-    $settings->offset = $endTime;
-    $settings->save();
-    $logger->writeInfo("Update offset  $endTime...");
-}
+// Offset is updated per-window above. Do not update it here on partial failures.
