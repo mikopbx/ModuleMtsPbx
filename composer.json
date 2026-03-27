@@ -2,7 +2,9 @@
     "name": "mikopbx/moduletemplate",
     "description": "ModuleMtsPbx",
     "require": {
-        "mikopbx/core": ">=2020.2.757"
+        "mikopbx/core": ">=2020.2.757",
+        "cesargb/php-log-rotation": "^2.0",
+        "guzzlehttp/guzzle": "^7.0"
     },
     "autoload": {
         "psr-4": {
