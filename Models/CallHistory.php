@@ -207,6 +207,24 @@ class CallHistory extends ModulesModelsBase
      */
     public ?string $a_transfer = '0';
 
+    /**
+     * Длительность записи разговора по данным MTS (recDur).
+     *
+     * @Column(type="integer", nullable=true)
+     */
+    public ?string $mts_rec_dur = '0';
+
+    /**
+     * Состояние загрузки записи разговора:
+     *   pending — ожидает дозагрузки (recDur > 0, mp3 ещё не получен),
+     *   ok      — mp3 успешно сохранён,
+     *   none    — у звонка нет записи (recDur = 0),
+     *   gone    — запись недоступна (например, истёк срок хранения в MTS).
+     *
+     * @Column(type="string", length=16, nullable=true)
+     */
+    public ?string $mts_rec_status = '';
+
     public function initialize(): void
     {
         $this->setSource('mts_cdr');
