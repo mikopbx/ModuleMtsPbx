@@ -18,7 +18,8 @@ use Modules\ModuleMtsPbx\Models\ModuleMtsPbx;
 
 require_once 'Globals.php';
 
-const RECORDS_LOOKBACK_DAYS = 7;
+// MTS хранит записи 30 дней. +1 день буфер на часовые пояса / поздний фикс статуса.
+const RECORDS_LOOKBACK_DAYS = 31;
 const RECORDS_BATCH_LIMIT   = 200;
 const RECORDS_PID_FILE      = '/var/run/mts-records.pid';
 
@@ -75,6 +76,24 @@ if (empty($domain)) {
 }
 
 $since = (new DateTimeImmutable('-' . RECORDS_LOOKBACK_DAYS . ' days'))->format('Y-m-d H:i:s');
+
+// Устаревшие pending (запись в MTS уже удалена по истечении хранения) — помечаем gone,
+// чтобы они не висели вечно и не попадали в выборку при каждом запуске.
+$expiredCount = CallHistory::find([
+    "from_account = 'fs-mts' AND mts_rec_status = 'pending' AND start < :since:",
+    'bind' => ['since' => $since],
+])->count();
+if ($expiredCount > 0) {
+    $phalconDi = \Phalcon\Di::getDefault();
+    $db = $phalconDi->getShared('db');
+    $db->execute(
+        "UPDATE mts_cdr SET mts_rec_status = 'gone' "
+        . "WHERE from_account = 'fs-mts' AND mts_rec_status = 'pending' AND start < ?",
+        [$since]
+    );
+    $logger->writeInfo("Marked {$expiredCount} expired pending records as gone (older than " . RECORDS_LOOKBACK_DAYS . " days)");
+}
+
 $pendingCdrs = CallHistory::find([
     "from_account = 'fs-mts' AND mts_rec_status = 'pending' AND mts_rec_dur > 0 AND start >= :since:",
     'bind'  => ['since' => $since],
