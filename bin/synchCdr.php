@@ -27,6 +27,14 @@ use Modules\ModuleMtsPbx\Models\CallHistory;
 
 require_once 'Globals.php';
 
+// Лаг от текущего времени: MTS API не возвращает звонки, которые ещё в процессе.
+// Откатываем правую границу окна, чтобы дать звонкам успеть завершиться и попасть в индекс MTS.
+const MTS_SYNC_LAG_MINUTES = 5;
+
+// Перекрытие с предыдущим окном: пересинхронизируем последние N минут на каждом запуске.
+// CallHistory ищется по linkedid (см. ниже) — повторная обработка идемпотентна.
+const MTS_SYNC_OVERLAP_MINUTES = 10;
+
 $logger = new Logger('SyncCdr', 'ModuleMtsPbx');
 $haveError = false;
 function processExists():bool
@@ -124,13 +132,16 @@ if(empty($settings->offset)){
     $logger->writeInfo('Offset is empty start sync -30 day...');
     $startTime = $date->format('Y-m-d\TH:i:s');
 }else{
-    // Continue from last saved offset (keep exact time to avoid expanding the requested interval).
+    // Continue from last saved offset, отступая на MTS_SYNC_OVERLAP_MINUTES назад,
+    // чтобы перехватить звонки, которые ранее были в процессе на границе окна.
     $dt = new DateTime($settings->offset);
+    $dt->modify('-' . MTS_SYNC_OVERLAP_MINUTES . ' minutes');
     $startTime = $dt->format('Y-m-d\TH:i:s');
-    $logger->writeInfo('Start sync '.$startTime.'...');
+    $logger->writeInfo('Start sync '.$startTime.' (overlap '.MTS_SYNC_OVERLAP_MINUTES.'m)...');
 }
 $maxWindowDays = 10;
-$now = new DateTimeImmutable('now');
+// Откатываем правую границу окна на MTS_SYNC_LAG_MINUTES — даём активным звонкам завершиться.
+$now = (new DateTimeImmutable('now'))->modify('-' . MTS_SYNC_LAG_MINUTES . ' minutes');
 try {
     $trunksUrl = 'https://aa.mts.ru/api/ac20/trunks/all';
     $trunksQuery = [
@@ -216,7 +227,7 @@ while ($windowStart < $now) {
 
             if (is_array($res)) {
                 $count  = count($res);
-                $offset = $offset + $count - ($offset === 0 ? 1 : 0);
+                $offset = $offset + $count;
                 $results[] = $res;
                 continue;
             }
@@ -305,12 +316,17 @@ foreach ($fsData as $index => $cdr){
     $duration  = intval($cdr['duration']);
     $startDate = (new DateTime($cdr['startTime']))->modify($settings->gap.' hour');
 
+    $recDur = intval($cdr['recDur']);
     $filename = '';
-    if(intval($cdr['recDur']) > 0){
-        $filename = Storage::getMonitorDir().$startDate->format("/Y/m/d/H/").$cdr['callId'].'.mp3';
-        $filenameFail = $filename.'.fail';
-        if(!file_exists($filename)){
-            Util::mwMkdir(dirname($filename));
+    $recStatus = $recDur > 0 ? 'pending' : 'none';
+    if($recDur > 0){
+        $candidate = Storage::getMonitorDir().$startDate->format("/Y/m/d/H/").$cdr['callId'].'.mp3';
+        if(file_exists($candidate)){
+            // Уже скачана при предыдущем запуске.
+            $filename = $candidate;
+            $recStatus = 'ok';
+        } else {
+            Util::mwMkdir(dirname($candidate));
             $recordUrl = 'https://aa.mts.ru/api/ac20/trunks/record';
             $recordQuery = [
                 'Domain'  => $domain,
@@ -326,40 +342,51 @@ foreach ($fsData as $index => $cdr){
                         'Authorization' => 'Bearer '.$settings->authApiKey,
                         'accept' => 'application/json',
                     ],
-                    'timeout' => 5, 'connect_timeout' => 5, 'read_timeout' => 5
+                    'timeout' => 30, 'connect_timeout' => 5, 'read_timeout' => 30,
+                    'http_errors' => false,
                 ]);
                 $code = $response->getStatusCode();
                 $recordBody = $response->getBody()->getContents();
-                logHttpResponse($logger, $code, $code === 200 ? "binary bytes: ".strlen($recordBody) : $recordBody, 'trunks/record', $code !== 200);
+                $isError = ($code >= 400);
+                logHttpResponse(
+                    $logger,
+                    $code,
+                    $code === 200 ? "binary bytes: ".strlen($recordBody) : $recordBody,
+                    'trunks/record',
+                    $isError
+                );
                 if($code === 200){
-                    file_put_contents($filename, $recordBody);
-                    if(file_exists($filenameFail)){
-                        unlink($filenameFail);
-                        $logger->writeInfo($cdr,"Get recording OK, was new attempt...");
-                    }
-                }else{
-                    file_put_contents($filenameFail, $recordBody);
-                    $filename = '';
+                    file_put_contents($candidate, $recordBody);
+                    $filename = $candidate;
+                    $recStatus = 'ok';
+                } elseif($code === 404 || $code === 410){
+                    // Запись недоступна навсегда (истекло хранение и т.п.) — больше не пытаемся.
+                    $recStatus = 'gone';
+                } else {
+                    // 204 / 5xx / прочее — оставляем pending, дозагрузит downloadRecords.php.
+                    $recStatus = 'pending';
                 }
                 usleep(100000);
             }catch (Exception $e){
-                $logger->writeError($cdr,"Fail download file ".$e->getMessage());
-                $haveError = true;
                 logHttpException($logger, $e, 'trunks/record');
+                // Сетевая ошибка — пусть дозагрузчик повторит позже.
+                $recStatus = 'pending';
             }
         }
-    }else{
-        $filenameFail = $filename.'.fail';
-        $logger->writeError($cdr,"File not exists - recDur: 0");
-        file_put_contents($filenameFail, 'recDur is 0, recording is not expected');
     }
+
+    // DateTime::modify мутирует объект, поэтому считаем answer/endtime от клонов,
+    // иначе endtime получит лишние +wait секунд.
+    $waitSec  = intval($cdr['wait']);
+    $answerAt = (clone $startDate)->modify('+'.$waitSec.' seconds');
+    $endAt    = (clone $startDate)->modify('+'.$duration.' seconds');
 
     $tmpCdr = [
         'UNIQUEID'  => 'fs-mts-'.$cdr['callId'],
         'linkedid'  => 'fs-mts-'.$cdr['callId'],
         'start'     => $startDate->format("Y-m-d H:i:s.u"),
-        'answer'    => $startDate->modify('+'.intval($cdr['wait']).' seconds')->format("Y-m-d H:i:s.u"),
-        'endtime'   => $startDate->modify('+'.$duration.' seconds')->format("Y-m-d H:i:s.u"),
+        'answer'    => $answerAt->format("Y-m-d H:i:s.u"),
+        'endtime'   => $endAt->format("Y-m-d H:i:s.u"),
         "did"       => $cdr['via'],
         "src_num"   => $src,
         "src_chan"  => $src_chan,
@@ -373,6 +400,8 @@ foreach ($fsData as $index => $cdr){
         'work_completed'   => '1',
         'is_app'   => '0',
         'transfer'   => '0',
+        'mts_rec_dur'    => $recDur,
+        'mts_rec_status' => $recStatus,
     ];
 
     $ch = 0;
@@ -382,6 +411,11 @@ foreach ($fsData as $index => $cdr){
             $dbCDR = CallHistory::findFirst(['linkedid=:linkedid:', 'bind' => [ 'linkedid' => $tmpCdr['linkedid']]  ]);
             if(!$dbCDR){
                 $dbCDR = new CallHistory();
+            } else {
+                // Не затираем уже скачанную запись при пересинхронизации с перекрытием.
+                if($dbCDR->mts_rec_status === 'ok' && !empty($dbCDR->recordingfile) && file_exists($dbCDR->recordingfile)){
+                    unset($tmpCdr['recordingfile'], $tmpCdr['mts_rec_status']);
+                }
             }
             foreach ($tmpCdr as $key => $value){
                 $dbCDR->{$key} = $value;

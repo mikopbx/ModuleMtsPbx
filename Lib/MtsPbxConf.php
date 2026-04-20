@@ -29,9 +29,12 @@ class MtsPbxConf extends ConfigClass
         if ( !is_array($tasks)) {
             return;
         }
-        $workerPath = $this->moduleDir.DIRECTORY_SEPARATOR.'bin'.DIRECTORY_SEPARATOR.'synchCdr.php';
-        $phpPath = Util::which('php');
-        $tasks[]      = "*/1 * * * * $phpPath -f $workerPath > /dev/null 2> /dev/null\n";
+        $binDir          = $this->moduleDir.DIRECTORY_SEPARATOR.'bin'.DIRECTORY_SEPARATOR;
+        $syncCdrPath     = $binDir.'synchCdr.php';
+        $downloadRecPath = $binDir.'downloadRecords.php';
+        $phpPath         = Util::which('php');
+        $tasks[] = "*/1 * * * * $phpPath -f $syncCdrPath > /dev/null 2> /dev/null\n";
+        $tasks[] = "*/5 * * * * $phpPath -f $downloadRecPath > /dev/null 2> /dev/null\n";
     }
 
     public function getPBXCoreRESTAdditionalRoutes(): array

@@ -8,7 +8,9 @@
 
 namespace Modules\ModuleMtsPbx\Setup;
 
+use DateTimeImmutable;
 use MikoPBX\Modules\Setup\PbxExtensionSetupBase;
+use Modules\ModuleMtsPbx\Models\ModuleMtsPbx;
 
 
 /**
@@ -53,7 +55,34 @@ class PbxExtensionSetup extends PbxExtensionSetupBase
             $result = $this->addToSidebar();
         }
 
+        if ($result) {
+            $this->rewindOffsetForRecovery();
+        }
+
         return $result;
+    }
+
+    /**
+     * Сдвигает $settings->offset на 2 месяца назад при обновлении модуля.
+     * Это нужно для восстановления звонков и записей, которые были потеряны
+     * предыдущей версией синхронизатора. Повторная синхронизация безопасна:
+     * CallHistory обновляется по UNIQUEID, дубликаты не создаются.
+     */
+    private function rewindOffsetForRecovery(): void
+    {
+        try {
+            $settings = ModuleMtsPbx::findFirst();
+            if (!$settings || empty($settings->offset)) {
+                return;
+            }
+            $newOffset = (new DateTimeImmutable('-2 months'))->format('Y-m-d\TH:i:s');
+            if ($settings->offset > $newOffset) {
+                $settings->offset = $newOffset;
+                $settings->save();
+            }
+        } catch (\Throwable $e) {
+            // Невозможность сдвинуть offset не должна ломать установку модуля.
+        }
     }
 
     /**
