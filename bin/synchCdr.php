@@ -36,6 +36,19 @@ const MTS_SYNC_LAG_MINUTES = 5;
 const MTS_SYNC_OVERLAP_MINUTES = 10;
 
 $logger = new Logger('SyncCdr', 'ModuleMtsPbx');
+
+// Перехватываем все необработанные исключения — иначе MikoPBX может автоматически
+// отключить модуль из-за ошибки в воркере крона.
+set_exception_handler(static function (\Throwable $e) use ($logger) {
+    $logger->writeError([
+        'exception' => $e->getMessage(),
+        'file'      => $e->getFile(),
+        'line'      => $e->getLine(),
+        'trace'     => $e->getTraceAsString(),
+    ], 'Uncaught exception in synchCdr.php');
+    exit(1);
+});
+
 $haveError = false;
 function processExists():bool
 {
