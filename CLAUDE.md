@@ -65,7 +65,7 @@ Cron-задача `bin/synchCdr.php` запускается автоматиче
 - Каналы трансформируются в формат `PJSIP/mts_`
 - Телефоны: 10-значные номера автодополняются префиксом `7` (российский формат)
 - Часовой пояс: поле `gap` в настройках задаёт смещение в часах
-- Логи: `/core/logs/ModuleMtsPbx/{ClassName}.log`, ротация на 40MB
+- Логи: `{Directories::CORE_LOGS_DIR}/ModuleMtsPbx/{ClassName}.log` (на боевой PBX обычно `/storage/usbdisk1/mikopbx/log/ModuleMtsPbx/`), ротация на 40MB
 - Кеш: Redis с префиксом `ModuleMtsPbx_`, TTL по умолчанию 86400с
 - Совместимость Phalcon 4/5: через `MikoPBXVersion` — всегда использовать его для получения DI, валидаторов, текстовых утилит
 - Локализация: `Messages/ru.php` и `Messages/en.php`, ключи `repModuleMtsPbx.*`
