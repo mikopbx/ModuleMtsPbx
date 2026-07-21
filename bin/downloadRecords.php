@@ -18,11 +18,24 @@ use Modules\ModuleMtsPbx\Models\ModuleMtsPbx;
 
 require_once 'Globals.php';
 
-const RECORDS_LOOKBACK_DAYS = 7;
+// MTS хранит записи 30 дней. +1 день буфер на часовые пояса / поздний фикс статуса.
+const RECORDS_LOOKBACK_DAYS = 31;
 const RECORDS_BATCH_LIMIT   = 200;
 const RECORDS_PID_FILE      = '/var/run/mts-records.pid';
 
 $logger = new Logger('DownloadRecords', 'ModuleMtsPbx');
+
+// Перехватываем все необработанные исключения и фатальные ошибки — иначе
+// MikoPBX может автоматически отключить модуль из-за ошибки в воркере крона.
+set_exception_handler(static function (\Throwable $e) use ($logger) {
+    $logger->writeError([
+        'exception' => $e->getMessage(),
+        'file'      => $e->getFile(),
+        'line'      => $e->getLine(),
+        'trace'     => $e->getTraceAsString(),
+    ], 'Uncaught exception in downloadRecords.php');
+    exit(1);
+});
 
 function recordsProcessExists(): bool
 {
@@ -75,6 +88,30 @@ if (empty($domain)) {
 }
 
 $since = (new DateTimeImmutable('-' . RECORDS_LOOKBACK_DAYS . ' days'))->format('Y-m-d H:i:s');
+
+// Устаревшие pending (запись в MTS уже удалена по истечении хранения) — помечаем gone,
+// чтобы они не висели вечно и не попадали в выборку при каждом запуске.
+// Обновляем через модель: у модуля собственный SQLite-файл, глобальный DI 'db' указывает
+// на основную БД MikoPBX и не знает про mts_cdr.
+try {
+    $expired = CallHistory::find([
+        "from_account = 'fs-mts' AND mts_rec_status = 'pending' AND start < :since:",
+        'bind' => ['since' => $since],
+    ]);
+    $expiredCount = 0;
+    foreach ($expired as $row) {
+        $row->mts_rec_status = 'gone';
+        if ($row->save()) {
+            $expiredCount++;
+        }
+    }
+    if ($expiredCount > 0) {
+        $logger->writeInfo("Marked {$expiredCount} expired pending records as gone (older than " . RECORDS_LOOKBACK_DAYS . " days)");
+    }
+} catch (\Throwable $e) {
+    $logger->writeError($e->getMessage(), 'Fail to mark expired pending records');
+}
+
 $pendingCdrs = CallHistory::find([
     "from_account = 'fs-mts' AND mts_rec_status = 'pending' AND mts_rec_dur > 0 AND start >= :since:",
     'bind'  => ['since' => $since],

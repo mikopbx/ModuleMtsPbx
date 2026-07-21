@@ -34,6 +34,9 @@ class MtsPbxConf extends ConfigClass
         $downloadRecPath = $binDir.'downloadRecords.php';
         $phpPath         = Util::which('php');
         $tasks[] = "*/1 * * * * $phpPath -f $syncCdrPath > /dev/null 2> /dev/null\n";
+        // Глубокая дозагрузка: добирает длинные/отложенные звонки, которые попали в индекс MTS
+        // уже после того, как основное скользящее окно ушло вперёд. Offset не двигает.
+        $tasks[] = "*/30 * * * * $phpPath -f $syncCdrPath -- --lookback=720 > /dev/null 2> /dev/null\n";
         $tasks[] = "*/5 * * * * $phpPath -f $downloadRecPath > /dev/null 2> /dev/null\n";
     }
 

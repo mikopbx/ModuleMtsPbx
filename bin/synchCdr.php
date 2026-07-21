@@ -35,11 +35,39 @@ const MTS_SYNC_LAG_MINUTES = 5;
 // CallHistory ищется по linkedid (см. ниже) — повторная обработка идемпотентна.
 const MTS_SYNC_OVERLAP_MINUTES = 10;
 
-$logger = new Logger('SyncCdr', 'ModuleMtsPbx');
+// Режим глубокой дозагрузки (--lookback=N): запрашиваем CDR за последние N минут,
+// НЕ трогая offset. Нужен из-за длинных/отложенных звонков: CDR появляется в индексе
+// MTS только после завершения звонка, когда основное скользящее окно уже ушло вперёд.
+// Запускается отдельной cron-задачей реже, чем основной проход (см. MtsPbxConf::createCronTasks).
+$deepLookbackMinutes = 0;
+foreach ($argv as $arg) {
+    if (preg_match('/^--lookback=(\d+)$/', $arg, $m)) {
+        $deepLookbackMinutes = (int)$m[1];
+    }
+}
+$isDeep = $deepLookbackMinutes > 0;
+
+$logger = new Logger($isDeep ? 'SyncCdrDeep' : 'SyncCdr', 'ModuleMtsPbx');
+
+// Перехватываем все необработанные исключения — иначе MikoPBX может автоматически
+// отключить модуль из-за ошибки в воркере крона.
+set_exception_handler(static function (\Throwable $e) use ($logger) {
+    $logger->writeError([
+        'exception' => $e->getMessage(),
+        'file'      => $e->getFile(),
+        'line'      => $e->getLine(),
+        'trace'     => $e->getTraceAsString(),
+    ], 'Uncaught exception in synchCdr.php');
+    exit(1);
+});
+
 $haveError = false;
 function processExists():bool
 {
     $pid = posix_getpid();
+    // Единый lock для основного и глубокого проходов: они НЕ должны работать одновременно,
+    // иначе при пересекающихся окнах возникают гонки (дубли строк mts_cdr, порча mp3).
+    // Глубокий проход короткий и редкий — кратковременная блокировка ежеминутного безвредна.
     $pidFile = "/var/run/mts-sync.pid";
     $result = false;
     if(file_exists($pidFile)){
@@ -128,7 +156,12 @@ if(empty($domain)){
 
 $date = new DateTime();
 $date->modify('-30 day');
-if(empty($settings->offset)){
+if($isDeep){
+    // Глубокая дозагрузка: фиксированное окно назад от текущего времени, offset не используется.
+    $dt = (new DateTime())->modify('-' . $deepLookbackMinutes . ' minutes');
+    $startTime = $dt->format('Y-m-d\TH:i:s');
+    $logger->writeInfo('Deep lookback sync from '.$startTime.' ('.$deepLookbackMinutes.'m, offset untouched)...');
+}elseif(empty($settings->offset)){
     $logger->writeInfo('Offset is empty start sync -30 day...');
     $startTime = $date->format('Y-m-d\TH:i:s');
 }else{
@@ -260,9 +293,12 @@ while ($windowStart < $now) {
     }
 
     // Window synced successfully. Persist progress and move to next window.
-    $settings->offset = $windowEndTime;
-    $settings->save();
-    $logger->writeInfo("Update offset  {$windowEndTime}...");
+    // В режиме глубокой дозагрузки offset не трогаем — им управляет основной проход.
+    if (!$isDeep) {
+        $settings->offset = $windowEndTime;
+        $settings->save();
+        $logger->writeInfo("Update offset  {$windowEndTime}...");
+    }
 
     if ($windowEnd >= $now) {
         break;
@@ -287,6 +323,15 @@ $clientBeanstalk  = new BeanstalkClient(WorkerCallEvents::class);
 $logger->writeInfo("Parse CDRs...");
 
 foreach ($fsData as $index => $cdr){
+    // Глубокая дозагрузка добирает только ОТСУТСТВУЮЩИЕ звонки. Если звонок уже синхронизирован
+    // основным проходом — пропускаем целиком (без перекачки записи, без UPDATE и без повторной
+    // публикации в Beanstalk). Дозагрузкой записей к уже существующим CDR занимается downloadRecords.php.
+    if($isDeep){
+        $exists = CallHistory::findFirst(['linkedid=:linkedid:', 'bind' => [ 'linkedid' => 'fs-mts-'.$cdr['callId']]]);
+        if($exists){
+            continue;
+        }
+    }
     foreach (['via', 'an', 'dn'] as $key){
         $cdr[$key] = $cdr[$key]??'';
         try {
@@ -296,11 +341,16 @@ foreach ($fsData as $index => $cdr){
         }
     }
     if(intval($cdr['rel']) === 1){
-        // внутренний вызов
+        // Внутренний вызов между сотрудниками (без внешнего транка).
+        // Раньше блок не имел else и не задавал каналы: звонок проваливался в ветки ниже
+        // и получал случайную атрибуцию (а при пустом 'an' условие ''==='' ложно уводило
+        // его в «исходящий»). Задаём каналы явно и выходим из цепочки через elseif.
         $src = $cdr['an'];
         $dst = $cdr['dn'];
+        $src_chan = 'PJSIP/mts-'.$cdr['callId'];
+        $dst_chan = 'PJSIP/mts_'.$cdr['trunkId'].'-'.$cdr['callId'];
         $cdr['via'] = '';
-    }if($cdr['via'] === $cdr['an']){
+    }elseif($cdr['via'] === $cdr['an']){
         // Исходящий с номера сотрудника.
         $src = $cdr['an'];
         $dst = $cdr['dn'];
