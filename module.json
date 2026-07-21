@@ -4,6 +4,8 @@
   "support_email": "help@miko.ru",
   "version": "%ModuleVersion%",
   "min_pbx_version": "2020.2.757",
+  "lic_product_id": 299,
+  "lic_feature_id": 70,
   "release_settings": {
     "publish_release": true,
     "changelog_enabled": true,
