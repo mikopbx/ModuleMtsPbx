@@ -28,6 +28,7 @@ final class ExportCdrTo1CTest
             $this->testDefaultDateIsInclusive();
             $this->testGroupedXmlPreservesCallLegsAndEscapesAttributes();
             $this->testFailurePreservesExistingOutput();
+            $this->testManualImportProcessingSourceContract();
             fwrite(STDOUT, "OK ({$this->assertions} assertions)\n");
         } finally {
             $this->removeTree($this->tmpDir);
@@ -190,6 +191,33 @@ final class ExportCdrTo1CTest
         ]);
         $this->assertNotSame(0, $result['code'], 'broken schema fails with existing output');
         $this->assertSame('existing-content', (string) file_get_contents($output), 'failed export preserves existing output');
+    }
+
+    private function testManualImportProcessingSourceContract(): void
+    {
+        $root = dirname(__DIR__);
+        $source = $root . '/onec/ЗагрузкаИсторииЗвонковMtsPBX_v2';
+        $formElements = json_decode((string) file_get_contents($source . '/Form/ОсновнаяФорма/Form.elem.json'), true);
+        $this->assertTrue(is_array($formElements), 'v2 form element model is readable');
+        $commands = array_column($formElements['commands'] ?? [], 'name');
+        $this->assertTrue(in_array('ЗагрузитьИзXML', $commands, true), 'manual XML command exists');
+
+        $rawForm = (string) file_get_contents($source . '/Form/ОсновнаяФорма/Form.json');
+        $this->assertContains('ЗагрузитьИзXML', $rawForm, 'manual XML button exists in command panel');
+
+        $formModule = (string) file_get_contents($source . '/Form/ОсновнаяФорма/Form.obj.bsl');
+        $objectModule = (string) file_get_contents($source . '/ExternalDataProcessor.obj.bsl');
+        $this->assertContains('Процедура ЗагрузитьИзXML(', $formModule, 'client XML command handler exists');
+        $this->assertContains('НачатьПомещениеФайла', $formModule, 'client uploads selected file');
+        $this->assertContains('ПолучитьИзВременногоХранилища', $formModule, 'server reads temporary storage');
+        $this->assertContains('ОтменитьТранзакцию()', $objectModule, 'manual import rolls transaction back on failure');
+        $this->assertContains('ОбработатьЗаписиИстории(', $objectModule, 'manual and network paths use common parser');
+        $this->assertContains('ПроверитьОбработкуПропущенныхЗвонков(', $objectModule, 'manual import runs missed call processing');
+        $this->assertSame(
+            'f70db8c5592ee2de7e8ecc8e2ea98ce154019aad230785a2a3b0472754f04fea',
+            hash_file('sha256', $root . '/ЗагрузкаИсторииЗвонковMtsPBX_v1.epf'),
+            'original v1 EPF remains unchanged'
+        );
     }
 
     private function createCompatibleDatabase(string $path): PDO
