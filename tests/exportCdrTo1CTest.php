@@ -300,9 +300,20 @@ final class ExportCdrTo1CTest
         $this->assertContains('ОтменитьТранзакцию()', $objectModule, 'manual import rolls transaction back on failure');
         $this->assertContains('ОбработатьЗаписиИстории(', $objectModule, 'manual and network paths use common parser');
         $this->assertContains('ПроверитьОбработкуПропущенныхЗвонков(', $objectModule, 'manual import runs missed call processing');
-        $this->assertTrue(
-            stripos($objectModule, 'УстановитьИменованнуюБлокировку') === false,
-            'processing does not call unavailable named lock method'
+        $this->assertContains(
+            'ИмпортироватьИсториюЗвонков(ЗаписиИсторииXML, Ложь)',
+            $objectModule,
+            'manual XML import explicitly disables named lock'
+        );
+        $this->assertContains(
+            'Если ИспользоватьИменованнуюБлокировку Тогда',
+            $objectModule,
+            'shared processing guards named lock by import mode'
+        );
+        $this->assertContains(
+            'ПТ20_ОбщегоНазначения.УстановитьИменованнуюБлокировку',
+            $objectModule,
+            'standard synchronization retains named lock'
         );
         $this->assertSame(
             'f70db8c5592ee2de7e8ecc8e2ea98ce154019aad230785a2a3b0472754f04fea',
