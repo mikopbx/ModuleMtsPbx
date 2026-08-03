@@ -28,7 +28,8 @@ final class ExportCdrTo1CTest
             $this->testDefaultDateIsInclusive();
             $this->testOptionsAcceptSpaceSeparatedValues();
             $this->testCdrGeneralIsUsedWhenCdrTableAlsoExists();
-            $this->testGroupedXmlPreservesCallLegsAndEscapesAttributes();
+            $this->testAnsweredCallKeepsOnlyAnsweredLegs();
+            $this->testMissedIncomingCallKeepsOneLegTo2003();
             $this->testFailurePreservesExistingOutput();
             $this->testManualImportProcessingSourceContract();
             fwrite(STDOUT, "OK ({$this->assertions} assertions)\n");
@@ -168,7 +169,7 @@ final class ExportCdrTo1CTest
         $this->assertTrue(strpos($xml, 'from-wrong-cdr') === false, 'cdr table data is ignored');
     }
 
-    private function testGroupedXmlPreservesCallLegsAndEscapesAttributes(): void
+    private function testAnsweredCallKeepsOnlyAnsweredLegs(): void
     {
         $database = $this->tmpDir . '/grouped.db';
         $output = $this->tmpDir . '/grouped.xml';
@@ -179,8 +180,8 @@ final class ExportCdrTo1CTest
         );
         $rows = [
             ['2026-07-16 20:55:10', '', '', 'old', 'old', 'old-call', 'old-leg', '', 'NO ANSWER', 1, 0, ''],
-            ['2026-07-16 20:55:11', '2026-07-16 20:55:12', '2026-07-16 20:56:11', '100 & office', '7999<1>', 'group-1', 'leg-1', 'line&1', 'ANSWERED', 60, 59, '/records/a&b.mp3'],
-            ['2026-07-16 20:56:12', '', '2026-07-16 20:57:12', '100', '200', 'group-1', 'leg-2', 'line&1', 'NO ANSWER', 60, 0, ''],
+            ['2026-07-16 20:55:11.486', '2026-07-16 20:55:12.125', '2026-07-16 20:56:11.999', '100 & office', '7999<1>', 'group-1', 'leg-1', 'line&1', 'ANSWERED', 60, 59, '/records/a&b.mp3'],
+            ['2026-07-16 20:56:12.100', '', '2026-07-16 20:57:12.100', '100', '200', 'group-1', 'leg-2', 'line&1', 'NO ANSWER', 60, 0, ''],
             ['2026-07-16 21:00:00', '', '', '300', '400', '', 'fallback-unique', '', 'BUSY', 5, 0, ''],
             ['2026-07-16 21:01:00', '', '', '500', '600', '', '', '', 'BUSY', 5, 0, ''],
         ];
@@ -193,9 +194,10 @@ final class ExportCdrTo1CTest
             '--database=' . $database,
             '--from=2026-07-16 20:55:11',
             '--output=' . $output,
+            '--filter-for-1c',
         ]);
         $this->assertSame(0, $result['code'], 'grouped fixture exports');
-        $this->assertContains('строк 3', $result['stdout'], 'summary counts exported legs');
+        $this->assertContains('строк 2', $result['stdout'], 'summary counts retained legs');
         $this->assertContains('звонков 2', $result['stdout'], 'summary counts grouped calls');
         $this->assertContains('пропущено 1', $result['stdout'], 'summary counts missing identifiers');
 
@@ -203,27 +205,62 @@ final class ExportCdrTo1CTest
         $this->assertTrue($document->load($output), 'generated output is valid XML');
         $xpath = new DOMXPath($document);
         $this->assertSame(2, $xpath->query('/history/history_record')->length, 'one history record per call id');
-        $this->assertSame(2, $xpath->query('/history/history_record[@entire_id="group-1"]/details')->length, 'group contains both legs');
+        $this->assertSame(1, $xpath->query('/history/history_record[@entire_id="group-1"]/details')->length, 'answered group contains only answered legs');
         $this->assertSame(0, $xpath->query('/history/history_record[@entire_id="old-call"]')->length, 'row before boundary is excluded');
         $this->assertSame(1, $xpath->query('/history/history_record[@entire_id="fallback-unique"]')->length, 'UNIQUEID is fallback group id');
 
         $firstDetail = $xpath->query('/history/history_record[@entire_id="group-1"]/details[1]')->item(0);
         $this->assertTrue($firstDetail instanceof DOMElement, 'first detail exists');
-        $this->assertSame('group-1', $firstDetail->getAttribute('call_id'), 'call_id matches entire call id');
+        $this->assertSame('leg-1', $firstDetail->getAttribute('call_id'), 'call_id preserves leg UNIQUEID');
         $this->assertSame('ANSWER', $firstDetail->getAttribute('status'), 'answered maps to ANSWER');
         $this->assertContains('2026-07-16T20:55:11', $firstDetail->getAttribute('started'), 'start is RFC3339');
+        $this->assertContains('2026-07-16T20:55:12', $firstDetail->getAttribute('answered'), 'fractional answer is RFC3339');
+        $this->assertContains('2026-07-16T20:56:11', $firstDetail->getAttribute('finished'), 'fractional finish is RFC3339');
         $this->assertSame('/records/a&b.mp3', $firstDetail->getAttribute('record_file'), 'recording XML attribute round-trips');
-
-        $secondDetail = $xpath->query('/history/history_record[@entire_id="group-1"]/details[2]')->item(0);
-        $this->assertTrue($secondDetail instanceof DOMElement, 'second detail exists');
-        $this->assertSame('CANCEL', $secondDetail->getAttribute('status'), 'non-answered maps to CANCEL');
-        $this->assertSame('', $secondDetail->getAttribute('answered'), 'empty answer remains empty');
 
         $from = $xpath->query('/history/history_record[@entire_id="group-1"]/from[1]')->item(0);
         $to = $xpath->query('/history/history_record[@entire_id="group-1"]/to[1]')->item(0);
         $this->assertTrue($from instanceof DOMElement && $to instanceof DOMElement, 'participants exist');
         $this->assertSame('100 & office', $from->getAttribute('number'), 'ampersand round-trips');
         $this->assertSame('7999<1>', $to->getAttribute('number'), 'angle brackets round-trip');
+    }
+
+    private function testMissedIncomingCallKeepsOneLegTo2003(): void
+    {
+        $database = $this->tmpDir . '/missed-incoming.db';
+        $output = $this->tmpDir . '/missed-incoming.xml';
+        $pdo = $this->createCompatibleDatabase($database);
+        $insert = $pdo->prepare(
+            'INSERT INTO cdr_general (start, answer, endtime, src_num, dst_num, linkedid, UNIQUEID, did, disposition, duration, billsec, recordingfile) ' .
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        );
+        $rows = [
+            ['2026-07-17 10:00:00.100', '', '2026-07-17 10:00:05.100', '79990000000', '2003', 'missed-1', 'missed-main', 'line-1', 'NO ANSWER', 5, 0, ''],
+            ['2026-07-17 10:00:01.100', '', '2026-07-17 10:00:05.100', '79990000000', '2010', 'missed-1', 'missed-employee-1', 'line-1', 'NO ANSWER', 4, 0, ''],
+            ['2026-07-17 10:00:02.100', '', '2026-07-17 10:00:05.100', '79990000000', '2003', 'missed-1', 'missed-main-duplicate', 'line-1', 'NO ANSWER', 3, 0, ''],
+            ['2026-07-17 10:00:03.100', '', '2026-07-17 10:00:05.100', '79990000000', '2020', 'missed-1', 'missed-employee-2', 'line-1', 'NO ANSWER', 2, 0, ''],
+        ];
+        foreach ($rows as $row) {
+            $insert->execute($row);
+        }
+        $pdo = null;
+
+        $result = $this->runCli([
+            '--database', $database,
+            '--from', '2026-07-17 00:00:00',
+            '--output', $output,
+            '--filter-for-1c',
+        ]);
+        $this->assertSame(0, $result['code'], 'missed incoming fixture exports');
+        $document = new DOMDocument();
+        $this->assertTrue($document->load($output), 'missed incoming output is valid XML');
+        $xpath = new DOMXPath($document);
+        $this->assertSame(1, $xpath->query('/history/history_record[@entire_id="missed-1"]/details')->length, 'missed incoming keeps one leg');
+        $this->assertSame(1, $xpath->query('/history/history_record[@entire_id="missed-1"]/to[@number="2003"]')->length, 'retained missed leg targets 2003');
+        $detail = $xpath->query('/history/history_record[@entire_id="missed-1"]/details')->item(0);
+        $this->assertTrue($detail instanceof DOMElement, 'retained missed detail exists');
+        $this->assertSame('missed-main', $detail->getAttribute('call_id'), 'first leg to 2003 is retained');
+        $this->assertContains('2026-07-17T10:00:05', $detail->getAttribute('finished'), 'missed finish with milliseconds is populated');
     }
 
     private function testFailurePreservesExistingOutput(): void

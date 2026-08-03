@@ -11,25 +11,27 @@ function printUsage(): void
 Выгрузка истории звонков MikoPBX в XML для 1С.
 
 Использование:
-  php bin/exportCdrTo1C.php --output=FILE [--from="YYYY-MM-DD HH:MM:SS"] [--database=FILE]
+  php bin/exportCdrTo1C.php --output=FILE [--from="YYYY-MM-DD HH:MM:SS"] [--database=FILE] [--filter-for-1c]
 
 Параметры:
   --output=FILE    Итоговый XML-файл (обязательно).
   --from=DATE      Начальная дата включительно (по умолчанию: 2026-07-16 20:55:11).
   --database=FILE  SQLite CDR (по умолчанию: /storage/usbdisk1/mikopbx/astlogs/asterisk/cdr.db).
+  --filter-for-1c  Оставить только ANSWERED, а у пропущенных входящих — один вызов на 2003.
   --help           Показать эту справку.
 
 TEXT
     );
 }
 
-/** @return array{database:string,from:string,output:string,help:bool} */
+/** @return array{database:string,from:string,output:string,filter-for-1c:bool,help:bool} */
 function parseArguments(array $arguments): array
 {
     $options = [
         'database' => DEFAULT_CDR_DATABASE,
         'from' => DEFAULT_FROM_DATE,
         'output' => '',
+        'filter-for-1c' => false,
         'help' => false,
     ];
 
@@ -38,6 +40,10 @@ function parseArguments(array $arguments): array
         $argument = $arguments[$index];
         if ($argument === '--help' || $argument === '-h') {
             $options['help'] = true;
+            continue;
+        }
+        if ($argument === '--filter-for-1c') {
+            $options['filter-for-1c'] = true;
             continue;
         }
         if (substr($argument, 0, 2) !== '--') {
@@ -54,7 +60,7 @@ function parseArguments(array $arguments): array
             }
             $value = $arguments[++$index];
         }
-        if (!array_key_exists($name, $options) || $name === 'help') {
+        if (!array_key_exists($name, $options) || $name === 'help' || $name === 'filter-for-1c') {
             throw new InvalidArgumentException('Неизвестный параметр: --' . $name);
         }
         $options[$name] = $value;
@@ -110,7 +116,7 @@ function columnExpression(array $columns, string $name, string $fallback = "''")
 }
 
 /** @return array{rows:int,calls:int,skipped:int} */
-function exportCdr(PDO $pdo, array $table, string $from, string $output): array
+function exportCdr(PDO $pdo, array $table, string $from, string $output, bool $filterFor1C): array
 {
     $columns = $table['columns'];
     $id = columnExpression($columns, 'id', 'rowid');
@@ -157,6 +163,7 @@ function exportCdr(PDO $pdo, array $table, string $from, string $output): array
     $calls = 0;
     $skipped = 0;
     $currentCall = null;
+    $currentRows = [];
     try {
         if (!$writer->openUri($temporary)) {
             throw new RuntimeException('Не удалось открыть временный XML-файл.');
@@ -174,22 +181,21 @@ function exportCdr(PDO $pdo, array $table, string $from, string $output): array
             }
             if ($currentCall !== $callGroupId) {
                 if ($currentCall !== null) {
-                    $writer->endElement();
+                    $selectedRows = selectRowsFor1C($currentRows, $filterFor1C);
+                    writeHistoryRecord($writer, $currentCall, $selectedRows);
+                    $rows += count($selectedRows);
+                    $calls++;
                 }
                 $currentCall = $callGroupId;
-                $calls++;
-                $writer->startElement('history_record');
-                $writer->writeAttribute('no', $callGroupId);
-                $writer->writeAttribute('entire_id', $callGroupId);
-                $writer->writeAttribute('line', (string) $row['did_value']);
-                $writer->writeAttribute('line_number', (string) $row['did_value']);
+                $currentRows = [];
             }
-
-            writeDetail($writer, $row, $callGroupId);
-            $rows++;
+            $currentRows[] = $row;
         }
         if ($currentCall !== null) {
-            $writer->endElement();
+            $selectedRows = selectRowsFor1C($currentRows, $filterFor1C);
+            writeHistoryRecord($writer, $currentCall, $selectedRows);
+            $rows += count($selectedRows);
+            $calls++;
         }
         $writer->endElement();
         $writer->endDocument();
@@ -208,10 +214,49 @@ function exportCdr(PDO $pdo, array $table, string $from, string $output): array
     return ['rows' => $rows, 'calls' => $calls, 'skipped' => $skipped];
 }
 
+/** @return array<int,array<string,mixed>> */
+function selectRowsFor1C(array $rows, bool $filterFor1C): array
+{
+    if (!$filterFor1C) {
+        return $rows;
+    }
+
+    $answered = array_values(array_filter($rows, static function (array $row): bool {
+        return strtoupper(trim((string) $row['disposition_value'])) === 'ANSWERED';
+    }));
+    if ($answered !== []) {
+        return $answered;
+    }
+
+    foreach ($rows as $row) {
+        if (trim((string) $row['dst_num_value']) === '2003') {
+            return [$row];
+        }
+    }
+
+    return $rows;
+}
+
+function writeHistoryRecord(XMLWriter $writer, string $callGroupId, array $rows): void
+{
+    if ($rows === []) {
+        return;
+    }
+    $writer->startElement('history_record');
+    $writer->writeAttribute('no', $callGroupId);
+    $writer->writeAttribute('entire_id', $callGroupId);
+    $writer->writeAttribute('line', (string) $rows[0]['did_value']);
+    $writer->writeAttribute('line_number', (string) $rows[0]['did_value']);
+    foreach ($rows as $row) {
+        writeDetail($writer, $row, $callGroupId);
+    }
+    $writer->endElement();
+}
+
 function writeDetail(XMLWriter $writer, array $row, string $callGroupId): void
 {
     $writer->startElement('details');
-    $writer->writeAttribute('call_id', $callGroupId);
+    $writer->writeAttribute('call_id', trim((string) $row['unique_id']) !== '' ? (string) $row['unique_id'] : $callGroupId);
     $writer->writeAttribute('status', strtoupper((string) $row['disposition_value']) === 'ANSWERED' ? 'ANSWER' : 'CANCEL');
     $writer->writeAttribute('call_flow', '');
     $writer->writeAttribute('queue', '');
@@ -239,12 +284,20 @@ function toRfc3339(string $value): string
     if (trim($value) === '') {
         return '';
     }
-    $date = DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $value);
-    $errors = DateTimeImmutable::getLastErrors();
-    if ($date === false || ($errors !== false && ($errors['warning_count'] > 0 || $errors['error_count'] > 0))) {
+    $timezone = new DateTimeZone(date_default_timezone_get());
+    $date = false;
+    foreach (['!Y-m-d H:i:s.u', '!Y-m-d H:i:s.v', '!Y-m-d H:i:s'] as $format) {
+        $candidate = DateTimeImmutable::createFromFormat($format, $value, $timezone);
+        $errors = DateTimeImmutable::getLastErrors();
+        if ($candidate !== false && ($errors === false || ($errors['warning_count'] === 0 && $errors['error_count'] === 0))) {
+            $date = $candidate;
+            break;
+        }
+    }
+    if ($date === false) {
         return '';
     }
-    return $date->setTimezone(new DateTimeZone(date_default_timezone_get()))->format(DateTimeInterface::RFC3339);
+    return $date->format(DateTimeInterface::RFC3339);
 }
 
 function main(array $arguments): int
@@ -275,7 +328,7 @@ function main(array $arguments): int
         ]);
         $pdo->exec('PRAGMA query_only = ON');
         $table = findCdrTable($pdo);
-        $stats = exportCdr($pdo, $table, $from, $options['output']);
+        $stats = exportCdr($pdo, $table, $from, $options['output'], $options['filter-for-1c']);
         fwrite(STDOUT, sprintf(
             "Готово: строк %d, звонков %d, пропущено %d. Файл: %s\n",
             $stats['rows'],
