@@ -199,7 +199,7 @@ function exportCdr(PDO $pdo, array $table, string $from, string $output): array
 function writeDetail(XMLWriter $writer, array $row, string $callGroupId): void
 {
     $writer->startElement('details');
-    $writer->writeAttribute('call_id', (string) ($row['unique_id'] !== '' ? $row['unique_id'] : $callGroupId));
+    $writer->writeAttribute('call_id', $callGroupId);
     $writer->writeAttribute('status', strtoupper((string) $row['disposition_value']) === 'ANSWERED' ? 'ANSWER' : 'CANCEL');
     $writer->writeAttribute('call_flow', '');
     $writer->writeAttribute('queue', '');
