@@ -33,15 +33,27 @@ function parseArguments(array $arguments): array
         'help' => false,
     ];
 
-    foreach (array_slice($arguments, 1) as $argument) {
+    $arguments = array_values(array_slice($arguments, 1));
+    for ($index = 0, $count = count($arguments); $index < $count; $index++) {
+        $argument = $arguments[$index];
         if ($argument === '--help' || $argument === '-h') {
             $options['help'] = true;
             continue;
         }
-        if (substr($argument, 0, 2) !== '--' || strpos($argument, '=') === false) {
+        if (substr($argument, 0, 2) !== '--') {
             throw new InvalidArgumentException('Неизвестный параметр: ' . $argument);
         }
-        [$name, $value] = explode('=', substr($argument, 2), 2);
+
+        $option = substr($argument, 2);
+        if (strpos($option, '=') !== false) {
+            [$name, $value] = explode('=', $option, 2);
+        } else {
+            $name = $option;
+            if (!isset($arguments[$index + 1]) || substr($arguments[$index + 1], 0, 2) === '--') {
+                throw new InvalidArgumentException('Не указано значение параметра --' . $name . '.');
+            }
+            $value = $arguments[++$index];
+        }
         if (!array_key_exists($name, $options) || $name === 'help') {
             throw new InvalidArgumentException('Неизвестный параметр: --' . $name);
         }
@@ -65,7 +77,7 @@ function validateDate(string $value): string
 function findCdrTable(PDO $pdo): array
 {
     $required = ['start', 'linkedid', 'uniqueid', 'src_num', 'dst_num'];
-    $tables = $pdo->query("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('cdr', 'cdr_general', 'miko_cdr') ORDER BY CASE name WHEN 'cdr' THEN 1 WHEN 'cdr_general' THEN 2 ELSE 3 END");
+    $tables = $pdo->query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cdr_general'");
     if ($tables === false) {
         throw new RuntimeException('Не удалось прочитать схему SQLite.');
     }
@@ -84,7 +96,7 @@ function findCdrTable(PDO $pdo): array
         }
     }
 
-    throw new RuntimeException('В базе не найдена совместимая таблица CDR с обязательными полями.');
+    throw new RuntimeException('В базе не найдена совместимая таблица cdr_general с обязательными полями.');
 }
 
 function quoteIdentifier(string $identifier): string

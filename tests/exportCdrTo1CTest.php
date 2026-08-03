@@ -26,6 +26,8 @@ final class ExportCdrTo1CTest
             $this->testMissingDatabaseIsRejected();
             $this->testIncompatibleSchemaIsRejected();
             $this->testDefaultDateIsInclusive();
+            $this->testOptionsAcceptSpaceSeparatedValues();
+            $this->testCdrGeneralIsUsedWhenCdrTableAlsoExists();
             $this->testGroupedXmlPreservesCallLegsAndEscapesAttributes();
             $this->testFailurePreservesExistingOutput();
             $this->testManualImportProcessingSourceContract();
@@ -76,7 +78,7 @@ final class ExportCdrTo1CTest
     {
         $database = $this->tmpDir . '/incompatible.db';
         $pdo = new PDO('sqlite:' . $database);
-        $pdo->exec('CREATE TABLE cdr (id INTEGER PRIMARY KEY, start TEXT)');
+        $pdo->exec('CREATE TABLE cdr_general (id INTEGER PRIMARY KEY, start TEXT)');
         $pdo = null;
 
         $result = $this->runCli([
@@ -93,13 +95,13 @@ final class ExportCdrTo1CTest
         $output = $this->tmpDir . '/default-date.xml';
         $pdo = new PDO('sqlite:' . $database);
         $pdo->exec(
-            'CREATE TABLE cdr (' .
+            'CREATE TABLE cdr_general (' .
             'id INTEGER PRIMARY KEY, start TEXT, answer TEXT, endtime TEXT, ' .
             'src_num TEXT, dst_num TEXT, linkedid TEXT, UNIQUEID TEXT, ' .
             'did TEXT, disposition TEXT, duration INTEGER, billsec INTEGER, recordingfile TEXT)'
         );
         $insert = $pdo->prepare(
-            'INSERT INTO cdr (start, answer, endtime, src_num, dst_num, linkedid, UNIQUEID, did, disposition, duration, billsec, recordingfile) ' .
+            'INSERT INTO cdr_general (start, answer, endtime, src_num, dst_num, linkedid, UNIQUEID, did, disposition, duration, billsec, recordingfile) ' .
             'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
         );
         $insert->execute([
@@ -118,13 +120,61 @@ final class ExportCdrTo1CTest
         $this->assertContains('call-at-boundary', (string) file_get_contents($output), 'default boundary is inclusive');
     }
 
+    private function testOptionsAcceptSpaceSeparatedValues(): void
+    {
+        $database = $this->tmpDir . '/space-separated.db';
+        $output = $this->tmpDir . '/space-separated.xml';
+        $pdo = $this->createCompatibleDatabase($database);
+        $pdo->exec(
+            "INSERT INTO cdr_general (start, linkedid, UNIQUEID, src_num, dst_num) " .
+            "VALUES ('2026-07-17 10:00:00', 'space-separated-call', 'leg', '100', '200')"
+        );
+        $pdo = null;
+
+        $result = $this->runCli([
+            '--database', $database,
+            '--from', '2026-07-17 00:00:00',
+            '--output', $output,
+        ]);
+        $this->assertSame(0, $result['code'], 'space-separated long options export');
+        $this->assertTrue(is_file($output), 'space-separated output path is used');
+        $this->assertContains('space-separated-call', (string) file_get_contents($output), 'space-separated values reach exporter');
+    }
+
+    private function testCdrGeneralIsUsedWhenCdrTableAlsoExists(): void
+    {
+        $database = $this->tmpDir . '/both-cdr-tables.db';
+        $output = $this->tmpDir . '/both-cdr-tables.xml';
+        $pdo = $this->createCompatibleDatabase($database, 'cdr_general');
+        $this->createCompatibleTable($pdo, 'cdr');
+        $pdo->exec(
+            "INSERT INTO cdr_general (start, linkedid, UNIQUEID, src_num, dst_num) " .
+            "VALUES ('2026-07-17 10:00:00', 'from-cdr-general', 'general-leg', '100', '200')"
+        );
+        $pdo->exec(
+            "INSERT INTO cdr (start, linkedid, UNIQUEID, src_num, dst_num) " .
+            "VALUES ('2026-07-17 10:00:00', 'from-wrong-cdr', 'cdr-leg', '300', '400')"
+        );
+        $pdo = null;
+
+        $result = $this->runCli([
+            '--database', $database,
+            '--from', '2026-07-17 00:00:00',
+            '--output', $output,
+        ]);
+        $this->assertSame(0, $result['code'], 'database with cdr_general exports');
+        $xml = (string) file_get_contents($output);
+        $this->assertContains('from-cdr-general', $xml, 'cdr_general data is exported');
+        $this->assertTrue(strpos($xml, 'from-wrong-cdr') === false, 'cdr table data is ignored');
+    }
+
     private function testGroupedXmlPreservesCallLegsAndEscapesAttributes(): void
     {
         $database = $this->tmpDir . '/grouped.db';
         $output = $this->tmpDir . '/grouped.xml';
         $pdo = $this->createCompatibleDatabase($database);
         $insert = $pdo->prepare(
-            'INSERT INTO cdr (start, answer, endtime, src_num, dst_num, linkedid, UNIQUEID, did, disposition, duration, billsec, recordingfile) ' .
+            'INSERT INTO cdr_general (start, answer, endtime, src_num, dst_num, linkedid, UNIQUEID, did, disposition, duration, billsec, recordingfile) ' .
             'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
         );
         $rows = [
@@ -182,7 +232,7 @@ final class ExportCdrTo1CTest
         $output = $this->tmpDir . '/existing.xml';
         file_put_contents($output, 'existing-content');
         $pdo = new PDO('sqlite:' . $database);
-        $pdo->exec('CREATE TABLE cdr (id INTEGER PRIMARY KEY, start TEXT)');
+        $pdo->exec('CREATE TABLE cdr_general (id INTEGER PRIMARY KEY, start TEXT)');
         $pdo = null;
 
         $result = $this->runCli([
@@ -220,16 +270,24 @@ final class ExportCdrTo1CTest
         );
     }
 
-    private function createCompatibleDatabase(string $path): PDO
+    private function createCompatibleDatabase(string $path, string $table = 'cdr_general'): PDO
     {
         $pdo = new PDO('sqlite:' . $path);
+        $this->createCompatibleTable($pdo, $table);
+        return $pdo;
+    }
+
+    private function createCompatibleTable(PDO $pdo, string $table): void
+    {
+        if (!in_array($table, ['cdr', 'cdr_general'], true)) {
+            throw new InvalidArgumentException('Unsupported fixture table');
+        }
         $pdo->exec(
-            'CREATE TABLE cdr (' .
+            'CREATE TABLE ' . $table . ' (' .
             'id INTEGER PRIMARY KEY, start TEXT, answer TEXT, endtime TEXT, ' .
             'src_num TEXT, dst_num TEXT, linkedid TEXT, UNIQUEID TEXT, ' .
             'did TEXT, disposition TEXT, duration INTEGER, billsec INTEGER, recordingfile TEXT)'
         );
-        return $pdo;
     }
 
     /**
