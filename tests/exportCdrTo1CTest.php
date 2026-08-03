@@ -300,6 +300,10 @@ final class ExportCdrTo1CTest
         $this->assertContains('ОтменитьТранзакцию()', $objectModule, 'manual import rolls transaction back on failure');
         $this->assertContains('ОбработатьЗаписиИстории(', $objectModule, 'manual and network paths use common parser');
         $this->assertContains('ПроверитьОбработкуПропущенныхЗвонков(', $objectModule, 'manual import runs missed call processing');
+        $this->assertTrue(
+            stripos($objectModule, 'УстановитьИменованнуюБлокировку') === false,
+            'processing does not call unavailable named lock method'
+        );
         $this->assertSame(
             'f70db8c5592ee2de7e8ecc8e2ea98ce154019aad230785a2a3b0472754f04fea',
             hash_file('sha256', $root . '/ЗагрузкаИсторииЗвонковMtsPBX_v1.epf'),
