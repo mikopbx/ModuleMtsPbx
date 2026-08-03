@@ -325,6 +325,11 @@ final class ExportCdrTo1CTest
             $objectModule,
             'manual XML compatibility mode skips unavailable speech recognition queue'
         );
+        $this->assertContains(
+            "Если ИспользоватьИменованнуюБлокировку Тогда\n\t\t\t\tЕсли Не ПустаяСтрока(СтрокаДетализации.record_file) Или Не ПустаяСтрока(СтрокаДетализации.voicemail) Тогда",
+            $objectModule,
+            'manual XML compatibility mode does not access unavailable voicemail field'
+        );
         $this->assertSame(
             'f70db8c5592ee2de7e8ecc8e2ea98ce154019aad230785a2a3b0472754f04fea',
             hash_file('sha256', $root . '/ЗагрузкаИсторииЗвонковMtsPBX_v1.epf'),
