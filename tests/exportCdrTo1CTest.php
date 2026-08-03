@@ -315,6 +315,11 @@ final class ExportCdrTo1CTest
             $objectModule,
             'standard synchronization retains named lock'
         );
+        $this->assertContains(
+            "Если ИспользоватьИменованнуюБлокировку Тогда\n\t\t\t\tСтрокаДетализации.queue",
+            $objectModule,
+            'manual XML compatibility mode skips unavailable queue field'
+        );
         $this->assertSame(
             'f70db8c5592ee2de7e8ecc8e2ea98ce154019aad230785a2a3b0472754f04fea',
             hash_file('sha256', $root . '/ЗагрузкаИсторииЗвонковMtsPBX_v1.epf'),
