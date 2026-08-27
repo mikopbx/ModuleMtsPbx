@@ -12,7 +12,7 @@ var idForm = 'module-mts-pbx-form';
 var className = 'ModuleMtsPbx';
 var inputClassName = 'mikopbx-module-input';
 
-/* global globalRootUrl, globalTranslate, Form, Config */
+/* global globalRootUrl, globalTranslate, Form, Config, UserMessage */
 var ModuleMtsPbx = {
   $formObj: $('#' + idForm),
   $checkBoxes: $('#' + idForm + ' .ui.checkbox'),
@@ -56,7 +56,25 @@ var ModuleMtsPbx = {
     window[className].$checkBoxes.checkbox();
     window[className].$dropDowns.dropdown();
     window[className].initializeForm();
+    $('#reset-offset-button').on('click', window[className].resetOffset);
     $('.menu .item').tab();
+  },
+  resetOffset: function resetOffset() {
+    if (!window.confirm(globalTranslate.module_mts_pbx_reset_offset_confirm)) {
+      return;
+    }
+    $.api({
+      on: 'now',
+      url: "".concat(globalRootUrl).concat(idUrl, "/resetOffset"),
+      method: 'POST',
+      onSuccess: function onSuccess() {
+        UserMessage.showInformation(globalTranslate.module_mts_pbx_reset_offset_success);
+        window[className].applyConfigurationChanges();
+      },
+      onFailure: function onFailure() {
+        UserMessage.showError(globalTranslate.module_mts_pbx_reset_offset_error);
+      }
+    });
   },
   /**
    * Подготавливает список выбора

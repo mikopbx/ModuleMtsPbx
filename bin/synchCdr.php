@@ -21,6 +21,7 @@ use MikoPBX\Core\System\Util;
 use MikoPBX\Core\System\BeanstalkClient;
 use MikoPBX\Core\Workers\WorkerCallEvents;
 use Modules\ModuleMtsPbx\Models\ModuleMtsPbx;
+use Modules\ModuleMtsPbx\Lib\ModuleSettings;
 use Modules\ModuleMtsPbx\Lib\Logger;
 use MikoPBX\Core\System\Storage;
 use Modules\ModuleMtsPbx\Models\CallHistory;
@@ -138,7 +139,7 @@ if(!$settings || empty($settings->authApiKey)){
     exit(1);
 }
 
-$settings->gap = intval($settings->gap);
+$settings->gap = ModuleSettings::normalizeGap($settings->gap ?? '');
 $domain = '';
 try {
     $data = json_decode(base64_decode(explode('.', $settings->authApiKey)[1]), true);

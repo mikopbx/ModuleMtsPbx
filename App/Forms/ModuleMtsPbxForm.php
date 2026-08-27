@@ -12,6 +12,7 @@ use Phalcon\Forms\Form;
 use Phalcon\Forms\Element\Text;
 use Phalcon\Forms\Element\TextArea;
 use Phalcon\Forms\Element\Hidden;
+use Phalcon\Forms\Element\Numeric;
 class ModuleMtsPbxForm extends Form
 {
 
@@ -22,5 +23,9 @@ class ModuleMtsPbxForm extends Form
         $this->add(new TextArea('authApiKey', ['rows' => $rows]));
         $this->add(new Text('inLogin', ['rows' => $rows]));
         $this->add(new Text('inPassword', ['rows' => $rows]));
+        $this->add(new Numeric('gap', [
+            'step' => 1,
+            'style' => 'width: 100px;',
+        ]));
     }
 }
