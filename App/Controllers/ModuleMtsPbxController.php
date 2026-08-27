@@ -12,6 +12,7 @@ use MikoPBX\Common\Models\Extensions;
 use MikoPBX\Modules\PbxExtensionUtils;
 use Modules\ModuleMtsPbx\App\Forms\ModuleMtsPbxForm;
 use Modules\ModuleMtsPbx\Models\ModuleMtsPbx;
+use Modules\ModuleMtsPbx\Lib\ModuleSettings;
 use MikoPBX\Common\Models\Providers;
 
 class ModuleMtsPbxController extends BaseController
@@ -132,6 +133,10 @@ class ModuleMtsPbxController extends BaseController
         foreach ($record as $key => $value) {
             switch ($key) {
                 case 'id':
+                case 'offset':
+                    break;
+                case 'gap':
+                    $record->gap = ModuleSettings::normalizeGap($data['gap'] ?? '');
                     break;
                 case 'checkbox_field':
                 case 'toggle_field':
@@ -161,6 +166,26 @@ class ModuleMtsPbxController extends BaseController
         $this->flash->success($this->translation->_('ms_SuccessfulSaved'));
         $this->view->success = true;
         $this->db->commit();
+    }
+
+    /**
+     * Clears the synchronization cursor. An empty offset makes the worker
+     * reload CDR data starting 30 days ago.
+     */
+    public function resetOffsetAction(): void
+    {
+        if (!$this->request->isPost()) {
+            $this->view->success = false;
+            return;
+        }
+
+        $settings = ModuleMtsPbx::findFirst();
+        if ($settings === null || !ModuleSettings::resetOffset($settings)) {
+            $this->view->success = false;
+            return;
+        }
+
+        $this->view->success = true;
     }
 
     /**
