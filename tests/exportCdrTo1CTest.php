@@ -32,6 +32,7 @@ final class ExportCdrTo1CTest
             $this->testMissedIncomingCallKeepsOneLegTo2003();
             $this->testFailurePreservesExistingOutput();
             $this->testManualImportProcessingSourceContract();
+            $this->testNetworkImportProcessingSourceContract();
             fwrite(STDOUT, "OK ({$this->assertions} assertions)\n");
         } finally {
             $this->removeTree($this->tmpDir);
@@ -335,6 +336,44 @@ final class ExportCdrTo1CTest
             hash_file('sha256', $root . '/ЗагрузкаИсторииЗвонковMtsPBX_v1.epf'),
             'original v1 EPF remains unchanged'
         );
+    }
+
+    private function testNetworkImportProcessingSourceContract(): void
+    {
+        $objectModule = (string) file_get_contents(
+            dirname(__DIR__) . '/onec/ЗагрузкаИсторииЗвонковMtsPBX_v2/ExternalDataProcessor.obj.bsl'
+        );
+        $networkImport = $this->extractBslRoutine(
+            $objectModule,
+            'Функция ЗагрузитьИсториюЗвонков(host, offset) Экспорт',
+            'КонецФункции'
+        );
+        $httpRequest = $this->extractBslRoutine(
+            $objectModule,
+            'Функция ПолучитьCdrАТС(host, offset = 1, НовыйOffset)',
+            'КонецФункции'
+        );
+        $historyProcessor = $this->extractBslRoutine(
+            $objectModule,
+            'Процедура ОбработатьЗаписиИстории(',
+            'КонецПроцедуры'
+        );
+
+        $this->assertContains('ОтменитьТранзакцию()', $networkImport, 'network import rolls transaction back on failure');
+        $this->assertContains('Возврат offset;', $networkImport, 'network import preserves offset on failure');
+        $this->assertContains('ВызватьИсключение СообщениеHTTP;', $httpRequest, 'non-200 HTTP response aborts XML processing');
+        $this->assertContains('ОтветСервера.КодСостояния = 307', $httpRequest, 'temporary redirect is supported');
+        $this->assertContains('ОтветСервера.КодСостояния = 308', $httpRequest, 'permanent redirect is supported');
+        $this->assertSame(0, substr_count($historyProcessor, 'НачатьТранзакцию()'), 'shared history processor does not open a nested transaction');
+    }
+
+    private function extractBslRoutine(string $source, string $startMarker, string $endMarker): string
+    {
+        $start = strpos($source, $startMarker);
+        $this->assertTrue($start !== false, 'BSL routine start exists: ' . $startMarker);
+        $end = strpos($source, $endMarker, (int) $start);
+        $this->assertTrue($end !== false, 'BSL routine end exists: ' . $startMarker);
+        return substr($source, (int) $start, (int) $end - (int) $start + strlen($endMarker));
     }
 
     private function createCompatibleDatabase(string $path, string $table = 'cdr_general'): PDO
