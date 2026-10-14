@@ -21,6 +21,7 @@ use MikoPBX\Core\System\Util;
 use MikoPBX\Core\System\BeanstalkClient;
 use MikoPBX\Core\Workers\WorkerCallEvents;
 use Modules\ModuleMtsPbx\Models\ModuleMtsPbx;
+use Modules\ModuleMtsPbx\Lib\MtsApiTime;
 use Modules\ModuleMtsPbx\Lib\ModuleSettings;
 use Modules\ModuleMtsPbx\Lib\Logger;
 use MikoPBX\Core\System\Storage;
@@ -155,11 +156,10 @@ if(empty($domain)){
     exit(2);
 }
 
-$date = new DateTime();
-$date->modify('-30 day');
+$date = MtsApiTime::now()->modify('-30 day');
 if($isDeep){
     // Глубокая дозагрузка: фиксированное окно назад от текущего времени, offset не используется.
-    $dt = (new DateTime())->modify('-' . $deepLookbackMinutes . ' minutes');
+    $dt = MtsApiTime::now()->modify('-' . $deepLookbackMinutes . ' minutes');
     $startTime = $dt->format('Y-m-d\TH:i:s');
     $logger->writeInfo('Deep lookback sync from '.$startTime.' ('.$deepLookbackMinutes.'m, offset untouched)...');
 }elseif(empty($settings->offset)){
@@ -168,14 +168,14 @@ if($isDeep){
 }else{
     // Continue from last saved offset, отступая на MTS_SYNC_OVERLAP_MINUTES назад,
     // чтобы перехватить звонки, которые ранее были в процессе на границе окна.
-    $dt = new DateTime($settings->offset);
+    $dt = MtsApiTime::fromApiValue($settings->offset);
     $dt->modify('-' . MTS_SYNC_OVERLAP_MINUTES . ' minutes');
     $startTime = $dt->format('Y-m-d\TH:i:s');
     $logger->writeInfo('Start sync '.$startTime.' (overlap '.MTS_SYNC_OVERLAP_MINUTES.'m)...');
 }
 $maxWindowDays = 10;
 // Откатываем правую границу окна на MTS_SYNC_LAG_MINUTES — даём активным звонкам завершиться.
-$now = (new DateTimeImmutable('now'))->modify('-' . MTS_SYNC_LAG_MINUTES . ' minutes');
+$now = MtsApiTime::now()->modify('-' . MTS_SYNC_LAG_MINUTES . ' minutes');
 try {
     $trunksUrl = 'https://aa.mts.ru/api/ac20/trunks/all';
     $trunksQuery = [
@@ -210,7 +210,7 @@ $results = [];
 $limit = 1000;
 $statsUrl = 'https://aa.mts.ru/api/ac20/trunks/statistics';
 
-$windowStart = new DateTimeImmutable($startTime);
+$windowStart = MtsApiTime::fromApiValue($startTime);
 while ($windowStart < $now) {
     $windowEnd = $windowStart->modify("+{$maxWindowDays} days");
     if ($windowEnd > $now) {
