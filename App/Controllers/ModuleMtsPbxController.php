@@ -12,7 +12,12 @@ use MikoPBX\Common\Models\Extensions;
 use MikoPBX\Modules\PbxExtensionUtils;
 use Modules\ModuleMtsPbx\App\Forms\ModuleMtsPbxForm;
 use Modules\ModuleMtsPbx\Models\ModuleMtsPbx;
+use Modules\ModuleMtsPbx\Lib\CacheManager;
 use Modules\ModuleMtsPbx\Lib\ModuleSettings;
+use Modules\ModuleMtsPbx\Lib\MtsAccountKey;
+use Modules\ModuleMtsPbx\Lib\MtsAccountsForm;
+use Modules\ModuleMtsPbx\Lib\RestAPI\GetController;
+use Modules\ModuleMtsPbx\Models\MtsAccounts;
 use MikoPBX\Common\Models\Providers;
 
 class ModuleMtsPbxController extends BaseController
@@ -103,10 +108,28 @@ class ModuleMtsPbxController extends BaseController
         $settings = ModuleMtsPbx::findFirst();
         if ($settings === null) {
             $settings = new ModuleMtsPbx();
-            $settings->inLogin    = md5('l'.microtime(true));
-            $settings->inPassword = md5('p'.microtime(true));
+            ModuleSettings::initNewSettings($settings);
             $settings->save();
         }
+
+        $accounts = [];
+        foreach (MtsAccounts::find(['order' => 'id']) as $account) {
+            $accounts[] = [
+                'id'         => $account->id,
+                'name'       => (string)$account->name,
+                'authApiKey' => (string)$account->authApiKey,
+                'authApiKeyShort' => MtsAccountKey::shorten((string)$account->authApiKey, 6, 4),
+                'offsetView' => self::formatOffset((string)$account->offset),
+                'domain'     => (string)$account->domain,
+                'gap'        => (string)ModuleSettings::normalizeGap($account->gap),
+                'offset'     => (string)$account->offset,
+                'enabled'    => $account->isEnabled(),
+                'downloadRecords' => MtsAccounts::isDownloadRecordsEnabled($account->downloadRecords),
+                'legacy'     => $account->isLegacyIdFormat(),
+            ];
+        }
+        $this->view->accounts = $accounts;
+        $this->view->cdrAuthEnabled = ModuleSettings::isCdrAuthEnabled($settings->cdrAuthEnabled);
 
         $providers = Providers::find();
         $providersList = [];
@@ -120,56 +143,132 @@ class ModuleMtsPbxController extends BaseController
     }
 
     /**
+     * Позиция синхронизации для таблицы порталов: `2026-09-16T09:44:05` → `16.09.2026 09:44`.
+     */
+    private static function formatOffset(string $offset): string
+    {
+        if ($offset === '') {
+            return '';
+        }
+        try {
+            return (new \DateTimeImmutable($offset))->format('d.m.Y H:i');
+        } catch (\Throwable $e) {
+            return $offset;
+        }
+    }
+
+    /**
      * Save settings AJAX action
      */
     public function saveAction() :void
     {
-        $data       = $this->request->getPost();
-        $record = ModuleMtsPbx::findFirst();
-        if ($record === null) {
-            $record = new ModuleMtsPbx();
-        }
-        $this->db->begin();
-        foreach ($record as $key => $value) {
-            switch ($key) {
-                case 'id':
-                case 'offset':
-                    break;
-                case 'gap':
-                    $record->gap = ModuleSettings::normalizeGap($data['gap'] ?? '');
-                    break;
-                case 'checkbox_field':
-                case 'toggle_field':
-                    if (array_key_exists($key, $data)) {
-                        $record->$key = ($data[$key] === 'on') ? '1' : '0';
-                    } else {
-                        $record->$key = '0';
-                    }
-                    break;
-                default:
-                    if (array_key_exists($key, $data)) {
-                        $record->$key = $data[$key];
-                    } else {
-                        $record->$key = '';
-                    }
+        $data   = $this->request->getPost();
+        $result = MtsAccountsForm::normalize($data['accounts'] ?? []);
+        if (!empty($result['errors'])) {
+            $messages = [];
+            foreach ($result['errors'] as $error) {
+                $messages[] = $this->translation->_('module_mts_pbx_account_error_' . $error['code'], ['name' => $error['name']]);
             }
-        }
-
-        if ($record->save() === FALSE) {
-            $errors = $record->getMessages();
-            $this->flash->error(implode('<br>', $errors));
+            $this->flash->error(implode('<br>', $messages));
             $this->view->success = false;
-            $this->db->rollback();
             return;
         }
 
+        $record = ModuleMtsPbx::findFirst();
+        if ($record === null) {
+            $record = new ModuleMtsPbx();
+            ModuleSettings::initNewSettings($record);
+        }
+        $record->inLogin        = trim((string)($data['inLogin'] ?? ''));
+        $record->inPassword     = trim((string)($data['inPassword'] ?? ''));
+        $record->cdrAuthEnabled = MtsAccountsForm::isChecked($data['cdrAuthEnabled'] ?? '') ? '1' : '0';
+
+        // Модели модуля живут в собственной SQLite-базе, $this->db — основная БД MikoPBX.
+        $connection = $record->getWriteConnection();
+        $connection->begin();
+        try {
+            $accountIds = [];
+            $errors = $this->saveAccounts($result['rows'], $accountIds);
+            if (empty($errors) && $record->save() === false) {
+                $errors = $record->getMessages();
+            }
+        } catch (\Throwable $e) {
+            $errors = [$e->getMessage()];
+        }
+        if (!empty($errors)) {
+            $connection->rollback();
+            $this->flash->error(implode('<br>', $errors));
+            $this->view->success = false;
+            return;
+        }
+        $connection->commit();
+
+        CacheManager::setCacheData('ModuleMtsPbx', $record->toArray(), 60);
+        GetController::getAccounts(true);
+
         $this->flash->success($this->translation->_('ms_SuccessfulSaved'));
-        $this->view->success = true;
-        $this->db->commit();
+        $this->view->success    = true;
+        // Соответствие ключей новых блоков формы (newN) созданным ID — JS обновляет форму без перезагрузки.
+        $this->view->accountIds = $accountIds;
     }
 
     /**
-     * Clears the synchronization cursor. An empty offset makes the worker
+     * Создаёт/обновляет порталы из формы, удаляет отсутствующие в ней.
+     *
+     * @param array $rows       результат MtsAccountsForm::normalize()['rows']
+     * @param array $accountIds заполняется соответствием ключ формы => ID портала
+     *
+     * @return array ошибки сохранения
+     */
+    private function saveAccounts(array $rows, array &$accountIds): array
+    {
+        $existing = [];
+        foreach (MtsAccounts::find() as $account) {
+            $existing[(string)$account->id] = $account;
+        }
+
+        $errors = [];
+        $keep   = [];
+        foreach ($rows as $row) {
+            $account = $existing[$row['key']] ?? null;
+            if ($account === null) {
+                $account = new MtsAccounts();
+                $account->offset         = '';
+                $account->legacyIdFormat = 0;
+            } elseif (MtsAccountKey::normalizeDomain((string)$account->domain) !== MtsAccountKey::normalizeDomain($row['domain'])) {
+                // Ключ другого портала — его история начинается с нуля.
+                $account->offset = '';
+            }
+            $account->name       = $row['name'];
+            $account->authApiKey = $row['authApiKey'];
+            $account->domain     = $row['domain'];
+            $account->gap        = (string)$row['gap'];
+            $account->enabled    = $row['enabled'];
+            $account->downloadRecords = $row['downloadRecords'];
+            if (!$account->save()) {
+                foreach ($account->getMessages() as $message) {
+                    $errors[] = (string)$message;
+                }
+                continue;
+            }
+            $keep[(string)$account->id] = true;
+            $accountIds[$row['key']]    = (string)$account->id;
+        }
+        if (!empty($errors)) {
+            return $errors;
+        }
+        foreach ($existing as $id => $account) {
+            if (!isset($keep[$id]) && !$account->delete()) {
+                foreach ($account->getMessages() as $message) {
+                    $errors[] = (string)$message;
+                }
+            }
+        }
+        return $errors;
+    }
+
+    /**
+     * Clears the synchronization cursor of the account. An empty offset makes the worker
      * reload CDR data starting 30 days ago.
      */
     public function resetOffsetAction(): void
@@ -179,8 +278,8 @@ class ModuleMtsPbxController extends BaseController
             return;
         }
 
-        $settings = ModuleMtsPbx::findFirst();
-        if ($settings === null || !ModuleSettings::resetOffset($settings)) {
+        $account = MtsAccounts::findFirstById((int)$this->request->getPost('id'));
+        if ($account === null || !ModuleSettings::resetOffset($account)) {
             $this->view->success = false;
             return;
         }

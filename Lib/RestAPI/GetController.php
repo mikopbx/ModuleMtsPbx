@@ -15,83 +15,62 @@ use DateTime;
 use GuzzleHttp\Client;
 use GuzzleHttp\Cookie\FileCookieJar;
 use Modules\ModuleCTIClient\Models\ModuleCTIClient;
+use Modules\ModuleMtsPbx\Lib\BasicAuth;
 use Modules\ModuleMtsPbx\Lib\CacheManager;
+use Modules\ModuleMtsPbx\Lib\CdrXmlBuilder;
+use Modules\ModuleMtsPbx\Lib\ModuleSettings;
+use Modules\ModuleMtsPbx\Lib\MtsEventMapper;
 use Modules\ModuleMtsPbx\Models\CallHistory;
 use Modules\ModuleMtsPbx\Models\ModuleMtsPbx;
+use Modules\ModuleMtsPbx\Models\MtsAccounts;
 
 class GetController extends BaseController
 {
 
     public const USER_LIST = 'user_list';
+    public const ACCOUNTS_CACHE_KEY = 'accounts';
 
     /**
      * Последовательная загрузка данных из cdr таблицы.
-     * curl 'http://127.0.0.1:80/pbxcore/mts-pbx/cdr?offset=619640&limit=1';
+     * curl 'http://127.0.0.1:80/pbxcore/mts-pbx/cdr?offset=619640'
+     * При включённой авторизации (cdrAuthEnabled): curl -u login:password ...
      */
     public function getDataAction(): void
     {
-        $offset = intval($this->request->get('offset'));
-        $limit  = intval($this->request->get('limit'));
-        $limit  = max($limit, 5000);
-        $limit  = 5000;
-        $maxOffset = 0;
+        $settings = self::getSettings();
+        if (ModuleSettings::isCdrAuthEnabled($settings['cdrAuthEnabled'] ?? null)
+            && !self::checkAuth($this->request->getHeader('Authorization'))) {
+            self::logFailAuth();
+            $this->response->setStatusCode(401);
+            $this->response->setHeader('WWW-Authenticate', 'Basic realm="ModuleMtsPbx"');
+            $this->response->sendRaw();
+            return;
+        }
 
+        $offset = intval($this->request->get('offset'));
         $filter = [
             'id>:id: OR start>=:start:',
             'bind' => [
                 'id' => $offset,
             ],
             'order' => 'id',
-            'limit' => $limit
+            'limit' => CdrXmlBuilder::PAGE_LIMIT,
         ];
 
         try {
             $dt = new DateTime();
             $dt->setTime(0, 0, 0);
             $filter['bind']['start'] = $dt->format('Y-m-d H:i:s');
-            $arr_data = CallHistory::find($filter)->toArray();
+            $rows = CallHistory::find($filter)->toArray();
         }catch (\Exception $e){
-            $arr_data = [];
+            $rows = [];
         }
 
-        usort($arr_data, function($a, $b) {
-            return strtotime($a['start']) <=> strtotime($b['start']);
-        });
-        $xml_output = "<history>".PHP_EOL;
-        foreach ($arr_data as $data) {
-            $maxOffset = max($maxOffset, $data['id']);
-            if(!str_starts_with($data['linkedid'],'fs-mts-')){
-                continue;
-            }
-            $xml_output .= "<history_record no=\"$data[linkedid]\" entire_id=\"$data[linkedid]\" line=\"$data[did]\">";
-            $detailAttr = [
-                'call_id'      => $data['linkedid'],
-                'status'       => $data['disposition'] === 'ANSWERED'?'ANSWER':'CANCEL',
-                'call_flow'    => '',
-                'queue'        => '',
-                'start'        => $data['start'],
-                'started'      => (new DateTime($data['start']))->format('c'),
-                'answered'     => (new DateTime($data['answer']))->format('c'),
-                'finished'     => (new DateTime($data['endtime']))->format('c'),
-                'duration'     => $data['duration'],
-                'conversation' => $data['billsec'],
-                'record_file'  => $data['recordingfile'],
-                'finish_cause' => 'Normal Clearing',
-            ];
-            $attributesDetail = '';
-            foreach ($detailAttr as $tmp_key => $tmp_val) {
-                $attributesDetail .= sprintf('%s="%s" ', $tmp_key, $tmp_val);
-            }
-            $xml_output .= "<details $attributesDetail />";
-            $xml_output .= "<from ext=\"\" number=\"$data[src_num]\"></from>";
-            $xml_output .= "<to ext=\"\" number=\"$data[dst_num]\"></to>";
-            $xml_output .= '</history_record>'.PHP_EOL;
-        }
-
-        $xml_output .= '</history>'.PHP_EOL;
-        $this->response->setContent($xml_output);
+        $result = CdrXmlBuilder::build($rows, $offset);
+        $this->response->setContentType('application/xml', 'UTF-8');
+        $this->response->setContent($result['xml']);
         $this->response->setHeader('X-MIN-OFFSET', $offset);
-        $this->response->setHeader('X-MAX-OFFSET', max($maxOffset, $offset));
+        $this->response->setHeader('X-MAX-OFFSET', $result['maxOffset']);
         $this->response->sendRaw();
     }
 
@@ -106,27 +85,31 @@ class GetController extends BaseController
         $body = $this->request->getRawBody();
         $authHeader = $this->request->getHeader('Authorization');
         if(self::checkAuth($authHeader) === false){
-            openlog('ModuleMtsPbx', LOG_PID | LOG_PERROR, LOG_AUTH);
-            $user_agent = $_SERVER['HTTP_USER_AGENT'] ?? 'Undefined';
-            syslog(LOG_WARNING, "From {$_SERVER['REMOTE_ADDR']}. UserAgent: ({$user_agent}). Fail auth http.");
-            closelog();
+            self::logFailAuth();
             $this->response->setStatusCode(401);
             $this->response->sendRaw();
             exit;
         }
-        SystemMessages::sysLogMsg('ModuleMtsPbx', "Get authHeader: $authHeader POST {$_SERVER['REMOTE_ADDR']}: ".$body);
+        SystemMessages::sysLogMsg('ModuleMtsPbx', "POST {$_SERVER['REMOTE_ADDR']}: ".$body);
 
-        $data =  json_decode($body, true);
-        if($data['EventType'] === 'CallAccepted'){
-            $state = 'Calling';
-        }elseif ($data['EventType'] === 'CallAnswered'){
-            $state = 'Connected';
-        }elseif ($data['EventType'] === 'EndCall'){
-            $state = 'Finished';
-        }else{
+        $data = MtsEventMapper::decode((string)$body);
+        if ($data === null) {
+            SystemMessages::sysLogMsg('ModuleMtsPbx', 'Invalid event body, EventType is missing');
+            $this->response->setStatusCode(400);
             $this->response->sendRaw();
             exit;
         }
+        $state = MtsEventMapper::state($data['EventType']);
+        if ($state === null) {
+            $this->response->sendRaw();
+            exit;
+        }
+        $domain  = (string)($data['Domain'] ?? '');
+        $account = MtsEventMapper::findAccount(self::getAccounts(), $domain);
+        if ($account === null) {
+            SystemMessages::sysLogMsg('ModuleMtsPbx', "Unknown event Domain '{$domain}', CallID is sent without account prefix");
+        }
+        $callId = MtsEventMapper::callId($data, $account);
 
         $users = CacheManager::getCacheData(self::USER_LIST);
         if(empty($users)){
@@ -163,7 +146,7 @@ class GetController extends BaseController
                 'state'    => $state,
                 'from'     => ['number' => strlen($from)===10?'7'.$from:$from, 'extension' => ''],
                 'to'       => ['number' => strlen($to)===10?'7'.$to:$to, 'extension' => ''],
-                'call_id'  => $data['CallID']
+                'call_id'  => $callId
             ];
             try{
                 self::makeSoapRequest1C('call_event',  ['Subject' => 'provider.v1.calls', 'Data' => json_encode( $callData)] );
@@ -177,24 +160,26 @@ class GetController extends BaseController
         $this->response->sendRaw();
     }
 
-    public static function checkAuth($authHeader)
+    public static function checkAuth($authHeader): bool
     {
-        $ok = true;
         $settings = self::getSettings();
-        $validUsername = $settings['inLogin']??md5(microtime(true));
-        $validPassword = $settings['inPassword']??md5(microtime(true));
-        if (!$authHeader || !preg_match('/^Basic\s+(.*)$/i', $authHeader, $matches)) {
-            $ok = false;
-        }
-        $credentials = base64_decode($matches[1]);
-        if (strpos($credentials, ':') === false) {
-            $ok = false;
-        }
-        list($username, $password) = explode(':', $credentials, 2);
-        if ($username !== $validUsername || $password !== $validPassword) {
-            $ok = false;
-        }
-        return $ok;
+        return BasicAuth::check(
+            $authHeader,
+            (string)($settings['inLogin'] ?? ''),
+            (string)($settings['inPassword'] ?? '')
+        );
+    }
+
+    /**
+     * Сообщение для fail2ban (см. MtsPbxConf::generateFail2BanFilters).
+     */
+    private static function logFailAuth(): void
+    {
+        openlog('ModuleMtsPbx', LOG_PID | LOG_PERROR, LOG_AUTH);
+        $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? 'Undefined';
+        $remote    = $_SERVER['REMOTE_ADDR'] ?? '';
+        syslog(LOG_WARNING, "From {$remote}. UserAgent: ({$userAgent}). Fail auth http.");
+        closelog();
     }
 
     public static function getSettings()
@@ -208,6 +193,27 @@ class GetController extends BaseController
             }
         }
         return $settings;
+    }
+
+    /**
+     * Список порталов для сопоставления событий по Domain (кеш 60 сек, $refresh — перечитать из БД).
+     */
+    public static function getAccounts(bool $refresh = false): array
+    {
+        $accounts = $refresh ? [] : CacheManager::getCacheData(self::ACCOUNTS_CACHE_KEY);
+        if (!empty($accounts)) {
+            return $accounts['list'] ?? [];
+        }
+        $list = [];
+        foreach (MtsAccounts::find(['order' => 'id']) as $account) {
+            $list[] = [
+                'id'             => (int)$account->id,
+                'domain'         => (string)$account->domain,
+                'legacyIdFormat' => (string)$account->legacyIdFormat,
+            ];
+        }
+        CacheManager::setCacheData(self::ACCOUNTS_CACHE_KEY, ['list' => $list], 60);
+        return $list;
     }
 
     /**

@@ -29,22 +29,42 @@ class ModuleMtsPbx extends ModulesModelsBase
 
 
     /**
+     * Устарело: API ключ однопортальной версии. Перенесён в MtsAccounts при обновлении,
+     * колонка сохранена для возможности отката на предыдущую версию модуля.
      *
      * @Column(type="string", nullable=true, default="")
      */
     public $authApiKey='';
 
     /**
+     * Устарело: см. MtsAccounts::$offset.
      *
      * @Column(type="string", nullable=true, default="")
      */
     public $offset='';
 
     /**
+     * Устарело: см. MtsAccounts::$gap.
      *
      * @Column(type="string", nullable=true, default="0")
      */
     public $gap = '0';
+
+    /**
+     * 1 — GET /pbxcore/mts-pbx/cdr требует Basic Auth (inLogin/inPassword).
+     * Без default: у существующих установок колонка добавляется со значением NULL
+     * и при установке выставляется в 0, новые установки получают 1.
+     *
+     * @Column(type="integer", nullable=true)
+     */
+    public $cdrAuthEnabled;
+
+    /**
+     * 1 — однопортальные настройки уже перенесены в MtsAccounts.
+     *
+     * @Column(type="integer", nullable=true)
+     */
+    public $accountsMigrated;
 
     /**
      * @Column(type="string", nullable=true)

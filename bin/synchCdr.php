@@ -17,39 +17,38 @@
  * If not, see <https://www.gnu.org/licenses/>.
  */
 use GuzzleHttp\Client;
+use MikoPBX\Core\System\Processes;
 use MikoPBX\Core\System\Util;
-use MikoPBX\Core\System\BeanstalkClient;
-use MikoPBX\Core\Workers\WorkerCallEvents;
-use Modules\ModuleMtsPbx\Models\ModuleMtsPbx;
-use Modules\ModuleMtsPbx\Lib\MtsApiTime;
-use Modules\ModuleMtsPbx\Lib\ModuleSettings;
+use Modules\ModuleMtsPbx\bin\ConnectorDb;
 use Modules\ModuleMtsPbx\Lib\Logger;
-use MikoPBX\Core\System\Storage;
-use Modules\ModuleMtsPbx\Models\CallHistory;
+use Modules\ModuleMtsPbx\Lib\MtsCdrSync;
+use Modules\ModuleMtsPbx\Lib\ProcessLock;
 
 require_once 'Globals.php';
 
-// Лаг от текущего времени: MTS API не возвращает звонки, которые ещё в процессе.
-// Откатываем правую границу окна, чтобы дать звонкам успеть завершиться и попасть в индекс MTS.
-const MTS_SYNC_LAG_MINUTES = 5;
-
-// Перекрытие с предыдущим окном: пересинхронизируем последние N минут на каждом запуске.
-// CallHistory ищется по linkedid (см. ниже) — повторная обработка идемпотентна.
-const MTS_SYNC_OVERLAP_MINUTES = 10;
-
+// Синхронизация CDR включённых порталов MTS (см. Lib/MtsCdrSync).
+//
+// Без --account скрипт работает как диспетчер: для каждого портала, который сейчас не
+// синхронизируется, запускает в фоне отдельный процесс `--account=<id>` и сразу завершается.
+// BusyBox crond не запускает строку crontab повторно, пока жив её предыдущий процесс
+// ("process already running"), поэтому долгая загрузка истории одного портала,
+// выполняемая прямо в процессе cron, останавливала бы синхронизацию всех порталов.
+//
 // Режим глубокой дозагрузки (--lookback=N): запрашиваем CDR за последние N минут,
 // НЕ трогая offset. Нужен из-за длинных/отложенных звонков: CDR появляется в индексе
 // MTS только после завершения звонка, когда основное скользящее окно уже ушло вперёд.
 // Запускается отдельной cron-задачей реже, чем основной проход (см. MtsPbxConf::createCronTasks).
 $deepLookbackMinutes = 0;
+$accountId           = 0;
 foreach ($argv as $arg) {
     if (preg_match('/^--lookback=(\d+)$/', $arg, $m)) {
         $deepLookbackMinutes = (int)$m[1];
+    } elseif (preg_match('/^--account=(\d+)$/', $arg, $m)) {
+        $accountId = (int)$m[1];
     }
 }
-$isDeep = $deepLookbackMinutes > 0;
 
-$logger = new Logger($isDeep ? 'SyncCdrDeep' : 'SyncCdr', 'ModuleMtsPbx');
+$logger = new Logger($deepLookbackMinutes > 0 ? 'SyncCdrDeep' : 'SyncCdr', 'ModuleMtsPbx');
 
 // Перехватываем все необработанные исключения — иначе MikoPBX может автоматически
 // отключить модуль из-за ошибки в воркере крона.
@@ -63,432 +62,64 @@ set_exception_handler(static function (\Throwable $e) use ($logger) {
     exit(1);
 });
 
-$haveError = false;
-function processExists():bool
+/**
+ * Lock на портал: основной и глубокий проходы одного портала НЕ должны работать одновременно,
+ * иначе при пересекающихся окнах возникают гонки (дубли строк mts_cdr, порча mp3).
+ * Разные порталы друг друга не блокируют.
+ */
+function accountLockFile(int $accountId): string
 {
-    $pid = posix_getpid();
-    // Единый lock для основного и глубокого проходов: они НЕ должны работать одновременно,
-    // иначе при пересекающихся окнах возникают гонки (дубли строк mts_cdr, порча mp3).
-    // Глубокий проход короткий и редкий — кратковременная блокировка ежеминутного безвредна.
-    $pidFile = "/var/run/mts-sync.pid";
-    $result = false;
-    if(file_exists($pidFile)){
-        $psPath      = Util::which('ps');
-        $busyboxPath = Util::which('busybox');
-        $oldPid      = trim(file_get_contents($pidFile));
-        $output      = trim(shell_exec("$psPath -A -o 'pid' | $busyboxPath awk '{print $1}' | $busyboxPath grep  '^$oldPid\$'")??'');
-        if(!empty($output)){
-            echo "Old PID: $oldPid, Find processes: $output...".PHP_EOL;
-            $result = true;
-        }
-    }
-    if(!$result){
-        file_put_contents($pidFile, $pid);
-    }
-    return $result;
+    return "/var/run/mts-sync-{$accountId}.lock";
 }
 
-function truncateForLog(string $value, int $maxLen = 3000): string
-{
-    if (strlen($value) <= $maxLen) {
-        return $value;
-    }
-    $tailLen = strlen($value) - $maxLen;
-    return substr($value, 0, $maxLen) . "... [truncated {$tailLen} bytes]";
-}
-
-function logHttpRequest(Logger $logger, string $method, string $url, array $query, string $label): void
-{
-    $logger->writeInfo([
-        'label' => $label,
-        'method' => $method,
-        'url' => $url,
-        'query' => $query,
-    ], 'HTTP request');
-}
-
-function logHttpResponse(Logger $logger, int $status, string $body, string $label, bool $error = false): void
-{
-    $payload = [
-        'label' => $label,
-        'status' => $status,
-        'body' => truncateForLog($body),
-    ];
-    if ($error) {
-        $logger->writeError($payload, 'HTTP response');
-        return;
-    }
-    $logger->writeInfo($payload, 'HTTP response');
-}
-
-function logHttpException(Logger $logger, \Exception $e, string $label): void
-{
-    $logger->writeError([
-        'label' => $label,
-        'exception' => $e->getMessage(),
-    ], 'HTTP exception');
-}
-
-if(processExists()){
-    echo "Process exists...".PHP_EOL;
-    exit(12);
-}
-
-$settings = ModuleMtsPbx::findFirst();
-if(!$settings || empty($settings->authApiKey)){
-    echo "empty settings";
+// Скрипт не обращается к SQLite модуля напрямую — только через воркер ConnectorDb.
+$accounts = ConnectorDb::call('getAccounts', [true]);
+if (!is_array($accounts)) {
+    $logger->writeError('ConnectorDb did not respond', 'Fail get accounts');
     exit(1);
 }
+$accounts = array_values(array_filter($accounts, static fn($account) => !empty($account['authApiKey'])));
 
-$settings->gap = ModuleSettings::normalizeGap($settings->gap ?? '');
-$domain = '';
-try {
-    $data = json_decode(base64_decode(explode('.', $settings->authApiKey)[1]), true);
-    $host = explode('@', $data['id'])[1]??'';
-    if(!empty($host)){
-        $domain = $host;
-    }
-}catch (\Exception $e){
-    $logger->writeError('Error parse authApiKey...'.$e->getMessage());
-}
-
-if(empty($domain)){
-    exit(2);
-}
-
-$date = MtsApiTime::now()->modify('-30 day');
-if($isDeep){
-    // Глубокая дозагрузка: фиксированное окно назад от текущего времени, offset не используется.
-    $dt = MtsApiTime::now()->modify('-' . $deepLookbackMinutes . ' minutes');
-    $startTime = $dt->format('Y-m-d\TH:i:s');
-    $logger->writeInfo('Deep lookback sync from '.$startTime.' ('.$deepLookbackMinutes.'m, offset untouched)...');
-}elseif(empty($settings->offset)){
-    $logger->writeInfo('Offset is empty start sync -30 day...');
-    $startTime = $date->format('Y-m-d\TH:i:s');
-}else{
-    // Continue from last saved offset, отступая на MTS_SYNC_OVERLAP_MINUTES назад,
-    // чтобы перехватить звонки, которые ранее были в процессе на границе окна.
-    $dt = MtsApiTime::fromApiValue($settings->offset);
-    $dt->modify('-' . MTS_SYNC_OVERLAP_MINUTES . ' minutes');
-    $startTime = $dt->format('Y-m-d\TH:i:s');
-    $logger->writeInfo('Start sync '.$startTime.' (overlap '.MTS_SYNC_OVERLAP_MINUTES.'m)...');
-}
-$maxWindowDays = 10;
-// Откатываем правую границу окна на MTS_SYNC_LAG_MINUTES — даём активным звонкам завершиться.
-$now = MtsApiTime::now()->modify('-' . MTS_SYNC_LAG_MINUTES . ' minutes');
-try {
-    $trunksUrl = 'https://aa.mts.ru/api/ac20/trunks/all';
-    $trunksQuery = [
-        'Domain'  => $domain,
-    ];
-    logHttpRequest($logger, 'GET', $trunksUrl, $trunksQuery, 'trunks/all');
-    $client = new Client();
-    $response = $client->request('GET', $trunksUrl, [
-        'query' => $trunksQuery,
-        'headers' => [
-            'Authorization' => 'Bearer '.$settings->authApiKey,
-            'accept' => 'application/json',
-        ],
-        'timeout' => 5, 'connect_timeout' => 5, 'read_timeout' => 5
-    ]);
-    $message = (string)$response->getBody();
-    $trunksData = json_decode($message, true);
-    $status  = $response->getStatusCode();
-    logHttpResponse($logger, $status, $message, 'trunks/all');
-}catch (\Exception $e){
-    $trunksData = null;
-    $status = 0;
-    $message = $e->getMessage();
-    logHttpException($logger, $e, 'trunks/all');
-}
-if(!is_array($trunksData)){
-    $logger->writeError([$status, $message],"Fail Get Trunks");
-    exit(11);
-}
-
-$results = [];
-$limit = 1000;
-$statsUrl = 'https://aa.mts.ru/api/ac20/trunks/statistics';
-
-$windowStart = MtsApiTime::fromApiValue($startTime);
-while ($windowStart < $now) {
-    $windowEnd = $windowStart->modify("+{$maxWindowDays} days");
-    if ($windowEnd > $now) {
-        $windowEnd = $now;
-    }
-    $windowStartTime = $windowStart->format('Y-m-d\TH:i:s');
-    $windowEndTime = $windowEnd->format('Y-m-d\TH:i:s');
-
-    $logger->writeInfo("Start sync window {$windowStartTime} - {$windowEndTime}...");
-
-    foreach ($trunksData as $trunkData) {
-        $offset = 0;
-        $count  = $limit;
-        while ($count >= $limit) {
-            $trunkId = $trunkData['trunkId'] ?? '';
-            $logger->writeInfo("Get CDR for {$trunkId}, offset: {$offset}");
-            usleep(200000);
-
-            $statsQuery = [
-                'Domain'  => $domain,
-                'TrunkId' => $trunkId,
-                'Begin'   => $windowStartTime,
-                'End'     => $windowEndTime,
-                'Limit'   => $limit,
-                'Offset'  => $offset,
-            ];
-            $logger->writeInfo($statsQuery, 'Statistics request params');
-            logHttpRequest($logger, 'GET', $statsUrl, $statsQuery, 'trunks/statistics');
-            try {
-                $response = $client->request('GET', $statsUrl, [
-                    'query' => $statsQuery,
-                    'headers' => [
-                        'Authorization' => 'Bearer '.$settings->authApiKey,
-                        'accept' => 'application/json',
-                    ],
-                    'timeout' => 5, 'connect_timeout' => 5, 'read_timeout' => 5
-                ]);
-                $message = (string)$response->getBody();
-                $res = json_decode($message, true);
-                $status = $response->getStatusCode();
-                logHttpResponse($logger, $status, $message, 'trunks/statistics');
-            } catch (\Exception $e) {
-                $res = null;
-                $status = 0;
-                $message = $e->getMessage();
-                logHttpException($logger, $e, 'trunks/statistics');
-            }
-
-            if (is_array($res)) {
-                $count  = count($res);
-                $offset = $offset + $count;
-                $results[] = $res;
-                continue;
-            }
-
-            if ($status === 204) {
-                // No CDR data for the selected period/page, not an error.
-                $count = 0;
-                $logger->writeInfo([
-                    'trunkId' => $trunkData['trunkId'],
-                    'offset' => $offset,
-                    'status' => $status,
-                    'window' => [$windowStartTime, $windowEndTime],
-                ], 'CDR page is empty');
-                continue;
-            }
-
-            $count = 0;
-            $haveError = true;
-            $logger->writeError([
-                "status: $status",
-                $message,
-                'query' => $statsQuery,
-            ], "Fail Get CDR for {$trunkId} offset: {$offset}");
-            break 2; // stop syncing this window on any error
-        }
-    }
-
-    if ($haveError) {
-        break;
-    }
-
-    // Window synced successfully. Persist progress and move to next window.
-    // В режиме глубокой дозагрузки offset не трогаем — им управляет основной проход.
-    if (!$isDeep) {
-        $settings->offset = $windowEndTime;
-        $settings->save();
-        $logger->writeInfo("Update offset  {$windowEndTime}...");
-    }
-
-    if ($windowEnd >= $now) {
-        break;
-    }
-    $windowStart = $windowEnd;
-}
-if (empty($results)) {
-    exit(0);
-}
-
-$fsData = array_merge(...$results);
-if(empty($fsData)){
-    exit(0);
-}
-
-$cdrData = [
-    'action' => 'insert_cdr',
-    'rows' => [],
-];
-
-$clientBeanstalk  = new BeanstalkClient(WorkerCallEvents::class);
-$logger->writeInfo("Parse CDRs...");
-
-foreach ($fsData as $index => $cdr){
-    // Глубокая дозагрузка добирает только ОТСУТСТВУЮЩИЕ звонки. Если звонок уже синхронизирован
-    // основным проходом — пропускаем целиком (без перекачки записи, без UPDATE и без повторной
-    // публикации в Beanstalk). Дозагрузкой записей к уже существующим CDR занимается downloadRecords.php.
-    if($isDeep){
-        $exists = CallHistory::findFirst(['linkedid=:linkedid:', 'bind' => [ 'linkedid' => 'fs-mts-'.$cdr['callId']]]);
-        if($exists){
+if ($accountId === 0) {
+    // Режим диспетчера.
+    $phpPath = Util::which('php');
+    foreach ($accounts as $account) {
+        $id = (int)$account['id'];
+        if (ProcessLock::isLocked(accountLockFile($id))) {
             continue;
         }
+        $command = "$phpPath -f " . __FILE__ . " -- --account={$id}"
+            . ($deepLookbackMinutes > 0 ? " --lookback={$deepLookbackMinutes}" : '');
+        Processes::mwExecBg($command);
     }
-    foreach (['via', 'an', 'dn'] as $key){
-        $cdr[$key] = $cdr[$key]??'';
-        try {
-            $cdr[$key] = strlen($cdr[$key])===10?'7'.$cdr[$key]:$cdr[$key];
-        }catch (\Exception $e){
-            $logger->writeError($cdr,"Parse CDRs...".$e->getMessage());
-        }
-    }
-    if(intval($cdr['rel']) === 1){
-        // Внутренний вызов между сотрудниками (без внешнего транка).
-        // Раньше блок не имел else и не задавал каналы: звонок проваливался в ветки ниже
-        // и получал случайную атрибуцию (а при пустом 'an' условие ''==='' ложно уводило
-        // его в «исходящий»). Задаём каналы явно и выходим из цепочки через elseif.
-        $src = $cdr['an'];
-        $dst = $cdr['dn'];
-        $src_chan = 'PJSIP/mts-'.$cdr['callId'];
-        $dst_chan = 'PJSIP/mts_'.$cdr['trunkId'].'-'.$cdr['callId'];
-        $cdr['via'] = '';
-    }elseif($cdr['via'] === $cdr['an']){
-        // Исходящий с номера сотрудника.
-        $src = $cdr['an'];
-        $dst = $cdr['dn'];
-        $src_chan = 'PJSIP/mts_'.$cdr['trunkId'].'-'.$cdr['callId'];
-        $dst_chan = 'PJSIP/mts-'.$cdr['callId'];
-        $cdr['via'] = '';
-    }else{
-        $src = $cdr['an'];
-        $dst = $cdr['dn'];
-        $src_chan = 'PJSIP/mts-'.$cdr['callId'];
-        $dst_chan = 'PJSIP/mts_'.$cdr['trunkId'].'-'.$cdr['callId'];
-    }
-    $duration  = intval($cdr['duration']);
-    $startDate = (new DateTime($cdr['startTime']))->modify($settings->gap.' hour');
+    exit(0);
+}
 
-    $recDur = intval($cdr['recDur']);
-    $filename = '';
-    $recStatus = $recDur > 0 ? 'pending' : 'none';
-    if($recDur > 0){
-        $candidate = Storage::getMonitorDir().$startDate->format("/Y/m/d/H/").$cdr['callId'].'.mp3';
-        if(file_exists($candidate)){
-            // Уже скачана при предыдущем запуске.
-            $filename = $candidate;
-            $recStatus = 'ok';
-        } else {
-            Util::mwMkdir(dirname($candidate));
-            $recordUrl = 'https://aa.mts.ru/api/ac20/trunks/record';
-            $recordQuery = [
-                'Domain'  => $domain,
-                'TrunkId' => $cdr['trunkId'],
-                'CallId'   => $cdr['callId'],
-                'Type'   => 'mp3'
-            ];
-            logHttpRequest($logger, 'GET', $recordUrl, $recordQuery, 'trunks/record');
-            try {
-                $response = $client->request('GET', $recordUrl, [
-                    'query' => $recordQuery,
-                    'headers' => [
-                        'Authorization' => 'Bearer '.$settings->authApiKey,
-                        'accept' => 'application/json',
-                    ],
-                    'timeout' => 30, 'connect_timeout' => 5, 'read_timeout' => 30,
-                    'http_errors' => false,
-                ]);
-                $code = $response->getStatusCode();
-                $recordBody = $response->getBody()->getContents();
-                $isError = ($code >= 400);
-                logHttpResponse(
-                    $logger,
-                    $code,
-                    $code === 200 ? "binary bytes: ".strlen($recordBody) : $recordBody,
-                    'trunks/record',
-                    $isError
-                );
-                if($code === 200){
-                    file_put_contents($candidate, $recordBody);
-                    $filename = $candidate;
-                    $recStatus = 'ok';
-                } elseif($code === 404 || $code === 410){
-                    // Запись недоступна навсегда (истекло хранение и т.п.) — больше не пытаемся.
-                    $recStatus = 'gone';
-                } else {
-                    // 204 / 5xx / прочее — оставляем pending, дозагрузит downloadRecords.php.
-                    $recStatus = 'pending';
-                }
-                usleep(100000);
-            }catch (Exception $e){
-                logHttpException($logger, $e, 'trunks/record');
-                // Сетевая ошибка — пусть дозагрузчик повторит позже.
-                $recStatus = 'pending';
-            }
-        }
-    }
-
-    // DateTime::modify мутирует объект, поэтому считаем answer/endtime от клонов,
-    // иначе endtime получит лишние +wait секунд.
-    $waitSec  = intval($cdr['wait']);
-    $answerAt = (clone $startDate)->modify('+'.$waitSec.' seconds');
-    $endAt    = (clone $startDate)->modify('+'.$duration.' seconds');
-
-    $tmpCdr = [
-        'UNIQUEID'  => 'fs-mts-'.$cdr['callId'],
-        'linkedid'  => 'fs-mts-'.$cdr['callId'],
-        'start'     => $startDate->format("Y-m-d H:i:s.u"),
-        'answer'    => $answerAt->format("Y-m-d H:i:s.u"),
-        'endtime'   => $endAt->format("Y-m-d H:i:s.u"),
-        "did"       => $cdr['via'],
-        "src_num"   => $src,
-        "src_chan"  => $src_chan,
-        "dst_num"   => $dst,
-        "dst_chan"  => $dst_chan,
-        'duration'  => $duration,
-        'billsec'   => $duration - intval($cdr['wait']),
-        'disposition'   => (intval($cdr['duration']) - intval($cdr['wait'])>1)?'ANSWERED':'NOANSWER',
-        'recordingfile'   => $filename,
-        'from_account'   => 'fs-mts',
-        'work_completed'   => '1',
-        'is_app'   => '0',
-        'transfer'   => '0',
-        'mts_rec_dur'    => $recDur,
-        'mts_rec_status' => $recStatus,
-    ];
-
-    $ch = 0;
-    while ($ch < 15){
-        $ch++;
-        try {
-            $dbCDR = CallHistory::findFirst(['linkedid=:linkedid:', 'bind' => [ 'linkedid' => $tmpCdr['linkedid']]  ]);
-            if(!$dbCDR){
-                $dbCDR = new CallHistory();
-            } else {
-                // Не затираем уже скачанную запись при пересинхронизации с перекрытием.
-                if($dbCDR->mts_rec_status === 'ok' && !empty($dbCDR->recordingfile) && file_exists($dbCDR->recordingfile)){
-                    unset($tmpCdr['recordingfile'], $tmpCdr['mts_rec_status']);
-                }
-            }
-            foreach ($tmpCdr as $key => $value){
-                $dbCDR->{$key} = $value;
-            }
-            if($dbCDR->save()){
-                break;
-            }
-            $logger->writeError($tmpCdr,"Fail save CDR...");
-        }catch (Exception $e){
-            $logger->writeError($tmpCdr,"Exception save CDR...");
-            sleep(1);
-        }
-    }
-
-    $cdrData['rows'][] = $tmpCdr;
-    if(count($cdrData['rows'])>10){
-        $clientBeanstalk->publish(json_encode($cdrData),WorkerCallEvents::class);
-        $cdrData['rows'] = [];
-        usleep(100000);
+$account = null;
+foreach ($accounts as $row) {
+    if ((int)$row['id'] === $accountId) {
+        $account = $row;
+        break;
     }
 }
-if(!empty($cdrData['rows'])){
-    $clientBeanstalk->publish(json_encode($cdrData),WorkerCallEvents::class);
+if ($account === null) {
+    exit(0); // портал удалён или выключен
 }
-// Offset is updated per-window above. Do not update it here on partial failures.
+
+$lock = new ProcessLock(accountLockFile($accountId));
+if (!$lock->acquire()) {
+    exit(0); // портал уже синхронизируется другим процессом
+}
+try {
+    $result = (new MtsCdrSync($account, $logger, new Client(), $deepLookbackMinutes))->run();
+} catch (\Throwable $e) {
+    $result = 1;
+    $logger->writeError([
+        'exception' => $e->getMessage(),
+        'file'      => $e->getFile(),
+        'line'      => $e->getLine(),
+    ], "[account {$accountId}] Exception in sync");
+} finally {
+    $lock->release();
+}
+exit($result);
