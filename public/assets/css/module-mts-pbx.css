@@ -67,9 +67,28 @@
 #module-mts-pbx-form #mts-accounts-table .ui.mini.input > input {
     padding: .45em .7em;
 }
-#module-mts-pbx-form #mts-accounts-table .ui.buttons .button,
+/*
+ * Кнопки той же высоты, что поля ввода .ui.mini.input: тот же размер шрифта, высота строки и отступы.
+ * У группы кнопок есть рамка 1px, у одиночной кнопки её нет — добавляем 1px к отступу.
+ */
+#module-mts-pbx-form #mts-accounts-table .ui.buttons,
 #module-mts-pbx-form #mts-accounts-table .edit-key-button {
-    padding: .5em .6em;
+    font-size: .78571429em;
+}
+#module-mts-pbx-form #mts-accounts-table .ui.buttons .button {
+    font-size: 1em;
+    line-height: 1.21428571em;
+    padding: .45em .7em;
+}
+#module-mts-pbx-form #mts-accounts-table .edit-key-button {
+    line-height: 1.21428571em;
+    padding: calc(.45em + 1px) .7em;
+}
+#module-mts-pbx-form #mts-accounts-table .ui.buttons .button > .icon,
+#module-mts-pbx-form #mts-accounts-table .edit-key-button > .icon {
+    height: 1.21428571em;
+    line-height: 1.21428571em;
+    margin: 0;
 }
 #module-mts-pbx-form #mts-accounts-table .ui.toggle.checkbox {
     transform: scale(.8);
