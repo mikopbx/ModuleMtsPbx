@@ -14,6 +14,7 @@ use MikoPBX\Core\System\Util;
 use MikoPBX\Core\Workers\Cron\WorkerSafeScriptsCore;
 use MikoPBX\Modules\Config\ConfigClass;
 use MikoPBX\PBXCoreREST\Lib\PBXApiResult;
+use Modules\ModuleMtsPbx\bin\ConnectorDb;
 use Modules\ModuleMtsPbx\Lib\RestAPI\GetController;
 
 class MtsPbxConf extends ConfigClass
@@ -38,6 +39,19 @@ class MtsPbxConf extends ConfigClass
         // уже после того, как основное скользящее окно ушло вперёд. Offset не двигает.
         $tasks[] = "*/30 * * * * $phpPath -f $syncCdrPath -- --lookback=720 > /dev/null 2> /dev/null\n";
         $tasks[] = "*/5 * * * * $phpPath -f $downloadRecPath > /dev/null 2> /dev/null\n";
+    }
+
+    /**
+     * Воркеры модуля, которые запускает и контролирует WorkerSafeScriptsCore.
+     */
+    public function getModuleWorkers(): array
+    {
+        return [
+            [
+                'type'   => WorkerSafeScriptsCore::CHECK_BY_BEANSTALK,
+                'worker' => ConnectorDb::class,
+            ],
+        ];
     }
 
     public function getPBXCoreRESTAdditionalRoutes(): array

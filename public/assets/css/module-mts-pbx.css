@@ -6,3 +6,94 @@
  *
  */
 
+
+/*
+ * Переключатель в одной строке с полями ввода: колонка прижата к низу строки,
+ * а обёртка переключателя имеет высоту поля ввода Semantic UI
+ * (padding .67857143em * 2 + line-height 1.21428571em + рамка 2px), переключатель по центру.
+ */
+#module-mts-pbx-form .fields > .field.mts-toggle-field {
+    align-self: flex-end;
+}
+#module-mts-pbx-form .mts-toggle-field .mts-toggle-wrap {
+    display: flex;
+    align-items: center;
+    min-height: calc(2.57142857em + 2px);
+}
+
+#module-mts-pbx-form .mts-nowrap .ui.toggle.checkbox label {
+    white-space: nowrap;
+}
+
+/* Таблица порталов. */
+#mts-accounts-table td {
+    vertical-align: middle;
+}
+#mts-accounts-table .mts-key-cell {
+    min-width: 10em;
+}
+#module-mts-pbx-form #mts-accounts-table th,
+#module-mts-pbx-form #mts-accounts-table td {
+    padding-left: .4em;
+    padding-right: .4em;
+}
+#mts-accounts-table .mts-key-view {
+    display: flex;
+    align-items: center;
+    gap: .5em;
+}
+#mts-accounts-table .mts-key-short {
+    white-space: nowrap;
+}
+#mts-accounts-table .mts-key-row td {
+    border-top: none;
+}
+#module-mts-pbx-form #mts-accounts-table .mts-key-row textarea {
+    min-height: 0;
+    height: 5em;
+    font-family: monospace;
+    font-size: .85em;
+    word-break: break-all;
+}
+#module-mts-pbx-form #mts-accounts-table input[data-field="gap"] {
+    width: 4.2em;
+}
+
+/* Компактные строки таблицы порталов. */
+#module-mts-pbx-form #mts-accounts-table td {
+    padding-top: .2em;
+    padding-bottom: .2em;
+}
+#module-mts-pbx-form #mts-accounts-table .ui.mini.input > input {
+    padding: .45em .7em;
+}
+/*
+ * Кнопки той же высоты, что поля ввода .ui.mini.input: тот же размер шрифта, высота строки и отступы.
+ * У группы кнопок есть рамка 1px, у одиночной кнопки её нет — добавляем 1px к отступу.
+ */
+#module-mts-pbx-form #mts-accounts-table .ui.buttons,
+#module-mts-pbx-form #mts-accounts-table .edit-key-button {
+    font-size: .78571429em;
+}
+#module-mts-pbx-form #mts-accounts-table .ui.buttons .button {
+    font-size: 1em;
+    line-height: 1.21428571em;
+    padding: .45em .7em;
+}
+#module-mts-pbx-form #mts-accounts-table .edit-key-button {
+    line-height: 1.21428571em;
+    padding: calc(.45em + 1px) .7em;
+}
+#module-mts-pbx-form #mts-accounts-table .ui.buttons .button > .icon,
+#module-mts-pbx-form #mts-accounts-table .edit-key-button > .icon {
+    height: 1.21428571em;
+    line-height: 1.21428571em;
+    margin: 0;
+}
+#module-mts-pbx-form #mts-accounts-table .ui.toggle.checkbox {
+    transform: scale(.8);
+    transform-origin: center;
+}
+#module-mts-pbx-form #mts-accounts-table .mts-key-short {
+    font-size: .85em;
+}

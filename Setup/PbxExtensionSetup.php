@@ -8,9 +8,10 @@
 
 namespace Modules\ModuleMtsPbx\Setup;
 
-use DateTimeImmutable;
 use MikoPBX\Modules\Setup\PbxExtensionSetupBase;
+use Modules\ModuleMtsPbx\Lib\ModuleSettings;
 use Modules\ModuleMtsPbx\Models\ModuleMtsPbx;
+use Modules\ModuleMtsPbx\Models\MtsAccounts;
 
 
 /**
@@ -56,32 +57,53 @@ class PbxExtensionSetup extends PbxExtensionSetupBase
         }
 
         if ($result) {
-            $this->rewindOffsetForRecovery();
+            $this->migrateSettings();
         }
 
         return $result;
     }
 
     /**
-     * Сдвигает $settings->offset на 2 месяца назад при обновлении модуля.
-     * Это нужно для восстановления звонков и записей, которые были потеряны
-     * предыдущей версией синхронизатора. Повторная синхронизация безопасна:
-     * CallHistory обновляется по UNIQUEID, дубликаты не создаются.
+     * Приводит настройки к многопортальной схеме:
+     *  - новая установка: создаёт строку настроек, авторизация CDR включена;
+     *  - обновление: авторизация CDR выключена (если не задана), API ключ/смещение/offset
+     *    однопортальной версии переносятся в MtsAccounts как портал со старым форматом ID.
      */
-    private function rewindOffsetForRecovery(): void
+    private function migrateSettings(): void
     {
         try {
             $settings = ModuleMtsPbx::findFirst();
-            if (!$settings || empty($settings->offset)) {
+            if ($settings === null) {
+                $settings = new ModuleMtsPbx();
+                ModuleSettings::initNewSettings($settings);
+                $settings->save();
                 return;
             }
-            $newOffset = (new DateTimeImmutable('-2 months'))->format('Y-m-d\TH:i:s');
-            if ($settings->offset > $newOffset) {
-                $settings->offset = $newOffset;
+
+            $changed = ModuleSettings::applyUpgradeDefaults($settings);
+            if (empty($settings->accountsMigrated)) {
+                $data = ModuleSettings::legacyAccountData($settings);
+                if ($data !== null && MtsAccounts::count() === 0) {
+                    $account = new MtsAccounts();
+                    foreach ($data as $key => $value) {
+                        $account->$key = $value;
+                    }
+                    if (!$account->save()) {
+                        // Не отмечаем перенос выполненным — повторим при следующей установке.
+                        if ($changed) {
+                            $settings->save();
+                        }
+                        return;
+                    }
+                }
+                $settings->accountsMigrated = '1';
+                $changed = true;
+            }
+            if ($changed) {
                 $settings->save();
             }
         } catch (\Throwable $e) {
-            // Невозможность сдвинуть offset не должна ломать установку модуля.
+            // Ошибка миграции не должна ломать установку модуля.
         }
     }
 

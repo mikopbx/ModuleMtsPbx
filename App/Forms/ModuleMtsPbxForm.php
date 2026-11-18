@@ -10,22 +10,15 @@ namespace Modules\ModuleMtsPbx\App\Forms;
 
 use Phalcon\Forms\Form;
 use Phalcon\Forms\Element\Text;
-use Phalcon\Forms\Element\TextArea;
 use Phalcon\Forms\Element\Hidden;
-use Phalcon\Forms\Element\Numeric;
 class ModuleMtsPbxForm extends Form
 {
 
     public function initialize($entity = null, $options = null) :void
     {
+        // Порталы MTS (API ключ, смещение времени) редактируются отдельным списком в шаблоне.
         $this->add(new Hidden('id', ['value' => $entity->id]));
-        $rows = max(round(strlen($entity->text_area_field) / 95), 2);
-        $this->add(new TextArea('authApiKey', ['rows' => $rows]));
-        $this->add(new Text('inLogin', ['rows' => $rows]));
-        $this->add(new Text('inPassword', ['rows' => $rows]));
-        $this->add(new Numeric('gap', [
-            'step' => 1,
-            'style' => 'width: 100px;',
-        ]));
+        $this->add(new Text('inLogin'));
+        $this->add(new Text('inPassword'));
     }
 }

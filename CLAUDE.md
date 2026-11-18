@@ -21,6 +21,13 @@ composer install
 
 # Тест SOAP-подключения к 1С
 php bin/test-soap.php
+
+# Тесты (без PHPUnit, чистый PHP)
+for t in tests/*.php; do php $t; done
+
+# Сборка JS (src → public/assets/js)
+docker run --rm -v "$PWD/..:/project/Extensions" ghcr.io/mikopbx/babel-compiler:latest \
+  /project/Extensions/ModuleMtsPbx/public/assets/js/src/module-mts-pbx-index.js
 ```
 
 Cron-задача `bin/synchCdr.php` запускается автоматически каждую минуту через `MtsPbxConf::createCronTasks()`.
@@ -29,14 +36,15 @@ Cron-задача `bin/synchCdr.php` запускается автоматиче
 
 ### Потоки данных
 
-1. **Синхронизация CDR** (`bin/synchCdr.php`, запуск по cron):
-   JWT-токен → получение транков MTS → скользящие 10-дневные окна → пагинация CDR (1000/запрос) → скачивание MP3-записей → сохранение в `CallHistory` → публикация в Beanstalk → обновление offset
+1. **Синхронизация CDR** (`bin/synchCdr.php` → `Lib/MtsCdrSync`, запуск по cron):
+   для каждого включённого портала `MtsAccounts` (свой lock `/var/run/mts-sync-{id}.pid`, ошибка одного не останавливает остальные):
+   JWT-токен → получение транков MTS → скользящие 10-дневные окна → пагинация CDR (1000/запрос) → скачивание MP3-записей → сохранение в `CallHistory` → публикация в Beanstalk → обновление offset портала
 
 2. **Обработка событий** (POST `/pbxcore/api/mts-pbx/v1/event`):
-   Basic Auth → маппинг событий MTS (CallAccepted/CallAnswered/EndCall → Calling/Connected/Finished) → получение списка пользователей из 1С (кеш 2 мин) → отправка событий в 1С через SOAP
+   Basic Auth → маппинг событий MTS (CallAccepted/CallAnswered/EndCall → Calling/Connected/Finished, `Lib/MtsEventMapper`) → портал по `Domain` → получение списка пользователей из 1С (кеш 2 мин) → отправка событий в 1С через SOAP
 
 3. **Выдача CDR** (GET `/pbxcore/mts-pbx/cdr?offset=X&limit=Y`):
-   XML-ответ с заголовками пагинации `X-MIN-OFFSET`, `X-MAX-OFFSET`
+   XML-ответ (`Lib/CdrXmlBuilder`, страница 5000, `limit` игнорируется) с заголовками пагинации `X-MIN-OFFSET`, `X-MAX-OFFSET`. Basic Auth (`inLogin`/`inPassword`) — если `cdrAuthEnabled = 1` (новые установки — включено, обновлённые — выключено)
 
 ### Ключевые классы и их базовые классы
 
@@ -51,8 +59,9 @@ Cron-задача `bin/synchCdr.php` запускается автоматиче
 
 ### Модели (Phalcon ORM с аннотациями)
 
-- **`ModuleMtsPbx`** → таблица `m_ModuleMtsPbx` — настройки модуля (API-ключ, offset, gap, логин/пароль REST API)
-- **`CallHistory`** → таблица `mts_cdr` — CDR звонков MTS с индексами по UNIQUEID, linkedid, start
+- **`ModuleMtsPbx`** → таблица `m_ModuleMtsPbx` — логин/пароль REST API, `cdrAuthEnabled`; поля `authApiKey`/`offset`/`gap` устарели (перенесены в `MtsAccounts` при установке, `accountsMigrated = 1`)
+- **`MtsAccounts`** → таблица `m_ModuleMtsPbxAccounts` — порталы MTS: API-ключ, домен, gap, offset, enabled, `legacyIdFormat`
+- **`CallHistory`** → таблица `mts_cdr` — CDR звонков MTS с индексами по UNIQUEID, linkedid, start; `mts_account_id`/`mts_call_id` (NULL у строк однопортальной версии)
 
 ### Внешние интеграции
 
@@ -61,7 +70,7 @@ Cron-задача `bin/synchCdr.php` запускается автоматиче
 
 ## Соглашения
 
-- Все UNIQUEID/linkedid звонков MTS имеют префикс `fs-mts-`
+- UNIQUEID/linkedid звонков MTS: `fs-mts-<callId>` для портала с `legacyIdFormat = 1` (перенесён из однопортальной версии), `fs-mts-<accountId>-<callId>` для остальных (`Lib/MtsCallId`); так же именуется mp3, `call_id` событий — без префикса `fs-mts-`
 - Каналы трансформируются в формат `PJSIP/mts_`
 - Телефоны: 10-значные номера автодополняются префиксом `7` (российский формат)
 - Часовой пояс: поле `gap` в настройках задаёт смещение в часах

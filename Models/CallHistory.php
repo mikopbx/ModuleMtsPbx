@@ -13,6 +13,7 @@
 
 namespace Modules\ModuleMtsPbx\Models;
 use MikoPBX\Modules\Models\ModulesModelsBase;
+use Phalcon\Events\Manager as EventsManager;
 
 /**
  * Class CallDetailRecords
@@ -219,15 +220,36 @@ class CallHistory extends ModulesModelsBase
      *   pending — ожидает дозагрузки (recDur > 0, mp3 ещё не получен),
      *   ok      — mp3 успешно сохранён,
      *   none    — у звонка нет записи (recDur = 0),
-     *   gone    — запись недоступна (например, истёк срок хранения в MTS).
+     *   gone    — запись недоступна (например, истёк срок хранения в MTS),
+     *   skipped — запись есть, но не скачивается: у портала выключено «Скачивать записи разговоров».
      *
      * @Column(type="string", length=16, nullable=true)
      */
     public ?string $mts_rec_status = '';
 
+    /**
+     * ID портала (MtsAccounts). NULL — строка загружена однопортальной версией модуля,
+     * относится к порталу с legacyIdFormat = 1.
+     *
+     * @Column(type="integer", nullable=true)
+     */
+    public ?string $mts_account_id = null;
+
+    /**
+     * Исходный callId MTS (без префикса и ID портала). NULL — см. mts_account_id,
+     * callId восстанавливается из linkedid старого формата.
+     *
+     * @Column(type="string", nullable=true)
+     */
+    public ?string $mts_call_id = null;
+
     public function initialize(): void
     {
         $this->setSource('mts_cdr');
         parent::initialize();
+        // ModelsBase после каждого save()/delete() публикует изменение в WorkerModelsEvents (Beanstalk)
+        // и чистит кеш через Redis KEYS. Для строк CDR это не нужно никому, а при загрузке истории
+        // (десятки тысяч строк) заметно тормозит запись и нагружает WorkerModelsEvents.
+        $this->setEventsManager(new EventsManager());
     }
 }

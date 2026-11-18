@@ -10,11 +10,13 @@
  */
 
 use GuzzleHttp\Client;
-use MikoPBX\Core\System\Storage;
 use MikoPBX\Core\System\Util;
+use Modules\ModuleMtsPbx\bin\ConnectorDb;
 use Modules\ModuleMtsPbx\Lib\Logger;
-use Modules\ModuleMtsPbx\Models\CallHistory;
-use Modules\ModuleMtsPbx\Models\ModuleMtsPbx;
+use Modules\ModuleMtsPbx\Lib\MtsAccountKey;
+use Modules\ModuleMtsPbx\Lib\MtsCallId;
+use Modules\ModuleMtsPbx\Lib\MtsCdrSync;
+use Modules\ModuleMtsPbx\Models\MtsAccounts;
 
 require_once 'Globals.php';
 
@@ -68,62 +70,56 @@ if (recordsProcessExists()) {
     exit(12);
 }
 
-$settings = ModuleMtsPbx::findFirst();
-if (!$settings || empty($settings->authApiKey)) {
+// Скрипт не обращается к SQLite модуля напрямую — только через воркер ConnectorDb.
+// Порталы: включённые — источник ключа/домена; строки mts_cdr без mts_account_id
+// (загружены однопортальной версией) относятся к порталу со старым форматом ID.
+$rows = ConnectorDb::call('getAccounts', [true]);
+if (!is_array($rows)) {
+    $logger->writeError('ConnectorDb did not respond', 'Fail get accounts');
     exit(1);
 }
-
-$domain = '';
-try {
-    $data = json_decode(base64_decode(explode('.', $settings->authApiKey)[1]), true);
-    $host = explode('@', $data['id'])[1] ?? '';
-    if (!empty($host)) {
-        $domain = $host;
+$accounts      = [];
+$legacyAccount = null;
+foreach ($rows as $account) {
+    if (empty($account['domain'])) {
+        $account['domain'] = MtsAccountKey::parseDomain((string)$account['authApiKey']);
     }
-} catch (\Exception $e) {
-    $logger->writeError('Error parse authApiKey...'.$e->getMessage());
+    if (empty($account['authApiKey']) || empty($account['domain'])) {
+        continue;
+    }
+    if (!MtsAccounts::isDownloadRecordsEnabled($account['downloadRecords'] ?? null)) {
+        continue; // скачивание записей у портала выключено
+    }
+    $accounts[(int)$account['id']] = $account;
+    if ($legacyAccount === null && (string)$account['legacyIdFormat'] === '1') {
+        $legacyAccount = $account;
+    }
 }
-if (empty($domain)) {
-    exit(2);
+if (empty($accounts)) {
+    exit(1);
 }
 
 $since = (new DateTimeImmutable('-' . RECORDS_LOOKBACK_DAYS . ' days'))->format('Y-m-d H:i:s');
 
 // Устаревшие pending (запись в MTS уже удалена по истечении хранения) — помечаем gone,
 // чтобы они не висели вечно и не попадали в выборку при каждом запуске.
-// Обновляем через модель: у модуля собственный SQLite-файл, глобальный DI 'db' указывает
-// на основную БД MikoPBX и не знает про mts_cdr.
-try {
-    $expired = CallHistory::find([
-        "from_account = 'fs-mts' AND mts_rec_status = 'pending' AND start < :since:",
-        'bind' => ['since' => $since],
-    ]);
-    $expiredCount = 0;
-    foreach ($expired as $row) {
-        $row->mts_rec_status = 'gone';
-        if ($row->save()) {
-            $expiredCount++;
-        }
-    }
-    if ($expiredCount > 0) {
-        $logger->writeInfo("Marked {$expiredCount} expired pending records as gone (older than " . RECORDS_LOOKBACK_DAYS . " days)");
-    }
-} catch (\Throwable $e) {
-    $logger->writeError($e->getMessage(), 'Fail to mark expired pending records');
+$expiredCount = ConnectorDb::call('markExpiredPendingRecords', [$since], 120);
+if ($expiredCount === null) {
+    $logger->writeError('ConnectorDb did not respond', 'Fail to mark expired pending records');
+} elseif ($expiredCount > 0) {
+    $logger->writeInfo("Marked {$expiredCount} expired pending records as gone (older than " . RECORDS_LOOKBACK_DAYS . " days)");
 }
 
-$pendingCdrs = CallHistory::find([
-    "from_account = 'fs-mts' AND mts_rec_status = 'pending' AND mts_rec_dur > 0 AND start >= :since:",
-    'bind'  => ['since' => $since],
-    'order' => 'start ASC',
-    'limit' => RECORDS_BATCH_LIMIT,
-]);
-
-if ($pendingCdrs->count() === 0) {
+$pendingCdrs = ConnectorDb::call('getPendingRecords', [$since, array_keys($accounts), $legacyAccount !== null, RECORDS_BATCH_LIMIT]);
+if (!is_array($pendingCdrs)) {
+    $logger->writeError('ConnectorDb did not respond', 'Fail get pending records');
+    exit(1);
+}
+if (count($pendingCdrs) === 0) {
     exit(0);
 }
 
-$logger->writeInfo("Start downloading records, pending count: ".$pendingCdrs->count());
+$logger->writeInfo("Start downloading records, pending count: ".count($pendingCdrs));
 
 $client    = new Client();
 $recordUrl = 'https://aa.mts.ru/api/ac20/trunks/record';
@@ -131,30 +127,49 @@ $ok        = 0;
 $gone      = 0;
 $stillPending = 0;
 
+$saveRecord = static function (array $row, array $fields) use ($logger): void {
+    if (ConnectorDb::call('updateCdrRecord', [(int)$row['id'], $fields]) !== true) {
+        $logger->writeError(['id' => $row['id'], 'fields' => $fields], 'Fail update record status (ConnectorDb)');
+    }
+};
+
 foreach ($pendingCdrs as $dbCDR) {
-    $callId  = substr($dbCDR->linkedid, strlen('fs-mts-'));
-    $trunkId = extractTrunkId($dbCDR->dst_chan);
+    $fields = [];
+    if ($dbCDR['mts_account_id'] === null || $dbCDR['mts_account_id'] === '') {
+        $account = $legacyAccount;
+        if ($account === null) {
+            continue;
+        }
+        $callId = MtsCallId::callIdFromLegacyLinkedId((string)$dbCDR['linkedid']);
+        // Заполняем новые колонки у строк однопортальной версии.
+        $fields['mts_account_id'] = (string)$account['id'];
+        $fields['mts_call_id']    = $callId;
+    } else {
+        $account = $accounts[(int)$dbCDR['mts_account_id']] ?? null;
+        if ($account === null) {
+            continue;
+        }
+        $callId = (string)$dbCDR['mts_call_id'];
+    }
+    $trunkId = extractTrunkId($dbCDR['dst_chan']);
     if ($trunkId === '') {
-        $trunkId = extractTrunkId($dbCDR->src_chan);
+        $trunkId = extractTrunkId($dbCDR['src_chan']);
     }
     if (empty($callId) || empty($trunkId)) {
         // Не можем восстановить параметры запроса — отметим как недоступно, иначе будем биться вечно.
-        $dbCDR->mts_rec_status = 'gone';
-        $dbCDR->save();
+        $saveRecord($dbCDR, $fields + ['mts_rec_status' => 'gone']);
         $gone++;
         continue;
     }
 
     try {
-        $startDate = new DateTime($dbCDR->start);
+        $startDate = new DateTime($dbCDR['start']);
     } catch (\Exception $e) {
         $startDate = new DateTime();
     }
-    $filename = Storage::getMonitorDir().$startDate->format("/Y/m/d/H/").$callId.'.mp3';
+    $filename = MtsCdrSync::recordPath((string)$dbCDR['linkedid'], $startDate);
     if (file_exists($filename)) {
-        $dbCDR->recordingfile = $filename;
-        $dbCDR->mts_rec_status = 'ok';
-        $dbCDR->save();
+        $saveRecord($dbCDR, $fields + ['recordingfile' => $filename, 'mts_rec_status' => 'ok']);
         $ok++;
         continue;
     }
@@ -163,13 +178,13 @@ foreach ($pendingCdrs as $dbCDR) {
     try {
         $response = $client->request('GET', $recordUrl, [
             'query' => [
-                'Domain'  => $domain,
+                'Domain'  => $account['domain'],
                 'TrunkId' => $trunkId,
                 'CallId'  => $callId,
                 'Type'    => 'mp3',
             ],
             'headers' => [
-                'Authorization' => 'Bearer '.$settings->authApiKey,
+                'Authorization' => 'Bearer '.$account['authApiKey'],
                 'accept'        => 'application/json',
             ],
             'timeout' => 30, 'connect_timeout' => 5, 'read_timeout' => 30,
@@ -180,24 +195,25 @@ foreach ($pendingCdrs as $dbCDR) {
 
         if ($code === 200) {
             file_put_contents($filename, $body);
-            $dbCDR->recordingfile  = $filename;
-            $dbCDR->mts_rec_status = 'ok';
+            $fields += ['recordingfile' => $filename, 'mts_rec_status' => 'ok'];
             $ok++;
         } elseif ($code === 404 || $code === 410) {
-            $dbCDR->mts_rec_status = 'gone';
+            $fields += ['mts_rec_status' => 'gone'];
             $gone++;
             $logger->writeInfo([
-                'callId' => $callId, 'trunkId' => $trunkId, 'status' => $code,
+                'account' => $account['id'], 'callId' => $callId, 'trunkId' => $trunkId, 'status' => $code,
             ], 'Record gone');
         } else {
             // 204 / 5xx — ещё не готово или временная ошибка, оставляем pending.
             $stillPending++;
         }
-        $dbCDR->save();
+        if (!empty($fields)) {
+            $saveRecord($dbCDR, $fields);
+        }
         usleep(150000);
     } catch (\Exception $e) {
         $logger->writeError([
-            'callId' => $callId, 'trunkId' => $trunkId, 'exception' => $e->getMessage(),
+            'account' => $account['id'], 'callId' => $callId, 'trunkId' => $trunkId, 'exception' => $e->getMessage(),
         ], 'Fail download record');
         $stillPending++;
     }
